@@ -1,0 +1,100 @@
+{
+  "name": "@unblocklabs/unblock-linear",
+  "version": "0.1.0",
+  "description": "Native Linear AgentSession channel for OpenClaw.",
+  "type": "module",
+  "main": "./dist/index.js",
+  "types": "./dist/index.d.ts",
+  "exports": {
+    ".": {
+      "types": "./dist/index.d.ts",
+      "import": "./dist/index.js"
+    }
+  },
+  "files": [
+    "dist/",
+    "index.ts",
+    "setup-entry.ts",
+    "openclaw.plugin.json",
+    "plugin-inspector.config.json"
+  ],
+  "scripts": {
+    "build": "tsc -p tsconfig.build.json",
+    "check": "tsc -p tsconfig.json --noEmit",
+    "test": "vitest run",
+    "plugin:inspect": "plugin-inspector check --config plugin-inspector.config.json --no-openclaw",
+    "plugin:inspect:runtime": "plugin-inspector check --config plugin-inspector.config.json --no-openclaw --runtime --mock-sdk --allow-execute",
+    "prepack": "npm run build",
+    "preflight": "npm run check && npm test && npm run build && npm run plugin:inspect && npm run plugin:inspect:runtime && npm pack --dry-run"
+  },
+  "openclaw": {
+    "extensions": [
+      "./index.ts"
+    ],
+    "runtimeExtensions": [
+      "./dist/index.js"
+    ],
+    "setupEntry": "./setup-entry.ts",
+    "channel": {
+      "id": "unblock-linear",
+      "label": "Unblock Linear",
+      "selectionLabel": "Unblock Linear",
+      "blurb": "Runs Linear AgentSession work through OpenClaw.",
+      "docsPath": "/plugins/unblock-linear"
+    },
+    "startup": {
+      "deferConfiguredChannelFullLoadUntilAfterListen": true
+    },
+    "install": {
+      "npmSpec": "@unblocklabs/unblock-linear",
+      "defaultChoice": "npm",
+      "minHostVersion": ">=2026.7.2"
+    },
+    "compat": {
+      "pluginApi": ">=2026.7.2",
+      "minGatewayVersion": ">=2026.7.2"
+    },
+    "build": {
+      "openclawVersion": "2026.7.2-beta.7",
+      "pluginSdkVersion": "2026.7.2-beta.7"
+    }
+  },
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/unblocklabs-ai/unblock-linear-plugin.git"
+  },
+  "homepage": "https://github.com/unblocklabs-ai/unblock-linear-plugin#readme",
+  "bugs": {
+    "url": "https://github.com/unblocklabs-ai/unblock-linear-plugin/issues"
+  },
+  "keywords": [
+    "openclaw",
+    "openclaw-plugin",
+    "channel",
+    "linear"
+  ],
+  "license": "MIT",
+  "engines": {
+    "node": ">=22"
+  },
+  "peerDependencies": {
+    "openclaw": ">=2026.7.2"
+  },
+  "peerDependenciesMeta": {
+    "openclaw": {
+      "optional": true
+    }
+  },
+  "dependencies": {
+    "ws": "^8.18.3",
+    "zod": "4.4.3"
+  },
+  "devDependencies": {
+    "@openclaw/plugin-inspector": "^0.3.21",
+    "@types/node": "^22.18.0",
+    "@types/ws": "^8.18.1",
+    "openclaw": "2026.7.2-beta.7",
+    "typescript": "^5.9.2",
+    "vitest": "^3.2.4"
+  }
+}

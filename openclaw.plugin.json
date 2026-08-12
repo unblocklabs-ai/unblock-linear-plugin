@@ -1,0 +1,89 @@
+{
+  "id": "unblock-linear",
+  "kind": "channel",
+  "name": "Unblock Linear",
+  "version": "0.1.0",
+  "description": "Runs Linear AgentSession work through OpenClaw.",
+  "activation": {
+    "onStartup": true,
+    "onChannels": ["unblock-linear"]
+  },
+  "contracts": {
+    "tools": ["linear"]
+  },
+  "channels": ["unblock-linear"],
+  "channelConfigs": {
+    "unblock-linear": {
+      "label": "Unblock Linear",
+      "description": "Connects an enrolled Linear relay device to OpenClaw.",
+      "schema": {
+        "type": "object",
+        "additionalProperties": false,
+        "properties": {
+          "name": { "type": "string" },
+          "enabled": { "type": "boolean", "default": true },
+          "accountId": { "type": "string", "default": "default" },
+          "origin": {
+            "type": "string",
+            "enum": [
+              "https://linear-staging.unblocklabs.ai",
+              "https://linear.unblocklabs.ai"
+            ]
+          },
+          "agentId": {
+            "type": "string",
+            "minLength": 1,
+            "maxLength": 128,
+            "pattern": "^[A-Za-z0-9_-]+$",
+            "description": "Worker relay identity only; OpenClaw agent routing uses normal channel bindings."
+          },
+          "deviceId": {
+            "type": "string",
+            "minLength": 1,
+            "maxLength": 128,
+            "pattern": "^[A-Za-z0-9_-]+$"
+          },
+          "enrollmentGeneration": {
+            "type": "integer",
+            "minimum": 1
+          },
+          "devicePrivateKey": {
+            "type": "object",
+            "additionalProperties": false,
+            "required": ["source", "provider", "id"],
+            "properties": {
+              "source": {
+                "type": "string",
+                "enum": ["env", "file", "exec"]
+              },
+              "provider": {
+                "type": "string",
+                "pattern": "^[a-z][a-z0-9_-]{0,63}$"
+              },
+              "id": {
+                "type": "string",
+                "minLength": 1
+              }
+            }
+          }
+        }
+      },
+      "uiHints": {
+        "devicePrivateKey": {
+          "label": "Device private key",
+          "help": "SecretRef for the enrolled private P-256 JWK.",
+          "sensitive": true
+        },
+        "agentId": {
+          "label": "Relay agent ID",
+          "help": "Worker relay identity only. Select the OpenClaw agent with normal channel bindings."
+        }
+      }
+    }
+  },
+  "configSchema": {
+    "type": "object",
+    "additionalProperties": false,
+    "properties": {}
+  }
+}

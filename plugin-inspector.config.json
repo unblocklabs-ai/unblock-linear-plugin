@@ -1,0 +1,16 @@
+{
+  "version": 1,
+  "plugin": {
+    "id": "unblock-linear",
+    "priority": "high",
+    "seams": ["manifest-contract", "sdk-surface", "channel", "dynamic-tool", "gateway-service", "cli"],
+    "sourceRoot": ".",
+    "expect": {
+      "registrations": ["registerChannel", "registerTool", "registerService", "registerGatewayMethod", "registerCli"],
+      "manifestContracts": ["tools"]
+    }
+  },
+  "capture": {
+    "mockSdk": true
+  }
+}

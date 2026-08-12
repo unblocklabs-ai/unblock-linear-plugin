@@ -1,0 +1,67 @@
+[
+  {
+    "v": 1,
+    "id": "3f66068f-77ab-4f19-8041-901234567890",
+    "type": "delivery.accept",
+    "agentId": "agent-1",
+    "deviceId": "device-1",
+    "timestamp": "2026-08-11T12:00:00.000Z",
+    "sessionId": "session-1",
+    "idempotencyKey": "delivery:1",
+    "payload": {
+      "deliveryId": "ed826a19-b025-4f21-a746-901234567890",
+      "openclawSessionId": "openclaw-session-1"
+    }
+  },
+  {
+    "v": 1,
+    "id": "4f66068f-77ab-4f19-8041-901234567890",
+    "type": "delivery.status",
+    "agentId": "agent-1",
+    "deviceId": "device-1",
+    "timestamp": "2026-08-11T12:00:00.000Z",
+    "sessionId": "session-1",
+    "idempotencyKey": "delivery:1",
+    "payload": { "deliveryId": "ed826a19-b025-4f21-a746-901234567890", "status": "started" }
+  },
+  {
+    "v": 1,
+    "id": "5f66068f-77ab-4f19-8041-901234567890",
+    "type": "activity",
+    "agentId": "agent-1",
+    "deviceId": "device-1",
+    "timestamp": "2026-08-11T12:00:00.000Z",
+    "sessionId": "session-1",
+    "idempotencyKey": "activity:1",
+    "payload": {
+      "commandId": "72b3f44f-7663-4284-b2a2-901234567890",
+      "activity": { "type": "thought", "body": "Working", "ephemeral": true }
+    }
+  },
+  {
+    "v": 1,
+    "id": "6f66068f-77ab-4f19-8041-901234567890",
+    "type": "rpc.request",
+    "agentId": "agent-1",
+    "deviceId": "device-1",
+    "timestamp": "2026-08-11T12:00:00.000Z",
+    "correlationId": "ff641766-cabb-41e3-b166-901234567890",
+    "idempotencyKey": "graphql:opaque:1",
+    "payload": {
+      "method": "linear.graphql",
+      "params": { "contextId": "slack:thread:1", "document": "query { viewer { id } }", "variables": {} }
+    }
+  },
+  {
+    "v": 1,
+    "id": "7f66068f-77ab-4f19-8041-901234567890",
+    "type": "rpc.request",
+    "agentId": "agent-1",
+    "deviceId": "device-1",
+    "timestamp": "2026-08-11T12:00:00.000Z",
+    "sessionId": "session-1",
+    "correlationId": "af641766-cabb-41e3-b166-901234567890",
+    "idempotencyKey": "rpc:legacy:1",
+    "payload": { "method": "linear.issue.read", "params": { "issueId": "issue-1" } }
+  }
+]

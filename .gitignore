@@ -1,0 +1,7 @@
+node_modules/
+dist/
+reports/
+coverage/
+*.tgz
+.DS_Store
+.prod.secrets
