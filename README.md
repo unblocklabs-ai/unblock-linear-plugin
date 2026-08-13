@@ -183,6 +183,37 @@ npm run preflight
 The preflight runs type checks, focused tests, build, static/runtime plugin
 inspection, and an npm pack dry run.
 
+## Release
+
+Releases require a clean `main` branch that exactly matches `origin/main`, an
+authenticated GitHub CLI, and permission to push to this repository:
+
+```sh
+npm run release -- 0.2.0
+```
+
+The release command:
+
+1. Confirms the Git tag and npm version do not already exist.
+2. Updates `package.json`, `package-lock.json`, and `openclaw.plugin.json` to the
+   same version.
+3. Runs the full preflight and restores those files if validation fails.
+4. Commits `chore: release v0.2.0`, creates the tag, and atomically pushes both.
+5. Creates the GitHub Release with generated notes.
+
+Publishing then runs in GitHub Actions through npm trusted publishing. Stable
+versions publish to npm's `latest` tag; prerelease versions such as
+`0.2.0-beta.1` create a GitHub prerelease and publish to npm's `next` tag. The
+workflow rejects a release when its Git tag, package version, and plugin
+manifest version do not match.
+
+If GitHub Release creation fails after the atomic push, finish that final step
+without changing versions or tags:
+
+```sh
+gh release create v0.2.0 --verify-tag --generate-notes --title v0.2.0
+```
+
 ## Security boundary
 
 - The Worker stores Linear secrets encrypted with its control-plane key.
