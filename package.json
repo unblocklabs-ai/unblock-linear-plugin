@@ -25,7 +25,12 @@
     "plugin:inspect": "plugin-inspector check --config plugin-inspector.config.json --no-openclaw",
     "plugin:inspect:runtime": "plugin-inspector check --config plugin-inspector.config.json --no-openclaw --runtime --mock-sdk --allow-execute",
     "prepack": "npm run build",
-    "preflight": "npm run check && npm test && npm run build && npm run plugin:inspect && npm run plugin:inspect:runtime && npm pack --dry-run"
+    "preflight": "npm run check && npm test && npm run build && npm run plugin:inspect && npm run plugin:inspect:runtime && npm pack --dry-run",
+    "release:check": "node scripts/check-release-version.mjs"
+  },
+  "publishConfig": {
+    "access": "public",
+    "provenance": true
   },
   "openclaw": {
     "extensions": [
