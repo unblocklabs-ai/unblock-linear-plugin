@@ -127,30 +127,15 @@ const rpcRequestFrameSchema = envelope.extend({
   sessionId: identifier.optional(),
   correlationId: uuid,
   idempotencyKey: identifier,
-  payload: z.discriminatedUnion("method", [
-    z.object({ method: z.literal("linear.issue.read"), params: z.object({ issueId: identifier }) }),
-    z.object({
-      method: z.literal("linear.issue.comment"),
-      params: z.object({ issueId: identifier, body: boundedText(16_000), commandId: uuid }),
+  payload: z.object({
+    method: z.literal("linear.graphql"),
+    params: z.object({
+      contextId: identifier,
+      operationName: identifier.optional(),
+      document: z.string().min(1),
+      variables: z.record(z.string(), z.json()),
     }),
-    z.object({
-      method: z.literal("linear.session.activity.emit"),
-      params: z.object({ commandId: uuid, activity: agentActivityCommandSchema }),
-    }),
-    z.object({
-      method: z.literal("linear.graphql"),
-      params: z.object({
-        contextId: identifier,
-        operationName: identifier.optional(),
-        document: z.string().min(1),
-        variables: z.record(z.string(), z.json()),
-      }),
-    }),
-  ]),
-}).superRefine((frame, ctx) => {
-  if (frame.payload.method !== "linear.graphql" && frame.sessionId === undefined) {
-    ctx.addIssue({ code: "custom", message: "Legacy RPC requests require sessionId", path: ["sessionId"] });
-  }
+  }),
 });
 
 export const relayFrameSchema = z.discriminatedUnion("type", [

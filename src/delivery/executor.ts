@@ -228,18 +228,7 @@ export class DeliveryExecutor {
       binding = await this.createBinding(frame);
     }
     active.binding = binding;
-    if (delivery.openclawSessionId !== binding.openclawSessionId) {
-      delivery = await this.options.journal.updateDelivery(frame.payload.deliveryId, {
-        openclawSessionId: binding.openclawSessionId,
-      });
-    }
-
-    await this.options.relay.send(this.acceptanceFrame(frame, binding));
-    if (delivery.status === "offered") {
-      delivery = await this.options.journal.updateDelivery(frame.payload.deliveryId, {
-        status: "accepted",
-      });
-    }
+    delivery = this.options.journal.getDelivery(frame.payload.deliveryId) ?? delivery;
 
     const terminalStatus = deliveryTerminalStatus(delivery) ??
       this.pendingTerminalStatus(frame.payload.deliveryId);
@@ -255,6 +244,19 @@ export class DeliveryExecutor {
         binding,
         recovered: true,
       };
+    }
+
+    if (delivery.openclawSessionId !== binding.openclawSessionId) {
+      delivery = await this.options.journal.updateDelivery(frame.payload.deliveryId, {
+        openclawSessionId: binding.openclawSessionId,
+      });
+    }
+
+    await this.options.relay.send(this.acceptanceFrame(frame, binding));
+    if (delivery.status === "offered") {
+      delivery = await this.options.journal.updateDelivery(frame.payload.deliveryId, {
+        status: "accepted",
+      });
     }
 
     const recovery = priorDelivery

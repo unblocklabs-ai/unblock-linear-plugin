@@ -22,7 +22,7 @@ before agent execution.
 Create a minimal TypeScript/npm package targeting:
 
 - Node.js 22+
-- OpenClaw `>=2026.7.2`
+- OpenClaw `>=2026.7.2-beta.7`
 - ESM
 - `ws` for authenticated upgrade headers
 - Zod for runtime protocol validation
@@ -294,7 +294,7 @@ configuration, and other arbitrary tools are not transactionally exactly-once.
 - focused tests;
 - Inspector;
 - `npm pack --dry-run`;
-- install the packed artifact into a local OpenClaw `2026.7.2` Gateway;
+- install the packed artifact into a local OpenClaw `2026.7.2-beta.7` Gateway;
 - prove the package uses built JavaScript and no private Worker key is included.
 
 ### Staging

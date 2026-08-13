@@ -386,6 +386,10 @@ export function createLinearTool(
         const uploaded = await executeManagedUpload({
           toolCallId: _toolCallId,
           ownerId: contextIdFor(context, runBinding),
+          ...(runBinding === undefined ? {} : {
+            deliveryId: runBinding.deliveryId,
+            sessionId: runBinding.linearSessionId,
+          }),
           fileRef: input.fileRef,
           ...(input.filename === undefined ? {} : { filename: input.filename }),
           ...(input.contentType === undefined ? {} : { contentType: input.contentType }),

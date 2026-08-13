@@ -14,7 +14,7 @@ import {
   type IntegrationRegistration,
 } from "../src/integration.js";
 import { parseOutboundRelayFrame, type OutboundRelayFrame } from "../src/relay/protocol.js";
-import { RelayJournal } from "../src/relay/journal.js";
+import { RelayJournal, type JournalSnapshot } from "../src/relay/journal.js";
 import type { RelaySocket, RelaySocketFactory } from "../src/relay/service.js";
 
 const PRIVATE_JWK = {
@@ -150,9 +150,12 @@ function apiWithRuntime(runtime: DeliveryRuntimePort): OpenClawPluginApi {
   } as unknown as OpenClawPluginApi;
 }
 
-function serviceContext(stateDir: string): Parameters<IntegrationRegistration["service"]["start"]>[0] {
+function serviceContext(
+  stateDir: string,
+  contextConfig: OpenClawConfig = config,
+): Parameters<IntegrationRegistration["service"]["start"]>[0] {
   return {
-    config,
+    config: contextConfig,
     stateDir,
     logger: {
       info: vi.fn(),
@@ -189,6 +192,24 @@ async function waitFor(assertion: () => void): Promise<void> {
     }
   }
   assertion();
+}
+
+async function waitForJournalSnapshot(
+  journalPath: string,
+  assertion: (snapshot: JournalSnapshot) => void,
+): Promise<JournalSnapshot> {
+  for (let attempt = 0; attempt < 400; attempt += 1) {
+    try {
+      const snapshot = JSON.parse(await readFile(journalPath, "utf8")) as JournalSnapshot;
+      assertion(snapshot);
+      return snapshot;
+    } catch {
+      await new Promise((resolve) => setTimeout(resolve, 5));
+    }
+  }
+  const snapshot = JSON.parse(await readFile(journalPath, "utf8")) as JournalSnapshot;
+  assertion(snapshot);
+  return snapshot;
 }
 
 function inboundBase() {
@@ -321,10 +342,88 @@ describe("OpenClaw integration", () => {
     const journal = await RelayJournal.open(
       join(stateDir, "plugins", "unblock-linear", "relay-journal.json"),
     );
-    expect(journal.getLifecycle()).toEqual({ fence: "device_replaced", generation: 1 });
+    expect(journal.getLifecycle()).toEqual({
+      fence: "device_replaced",
+      generation: 1,
+      enrollment: { agentId: "relay-agent", deviceId: "relay-device", enrollmentGeneration: 1 },
+    });
     await expect(registration.reconnect())
       .rejects.toThrow("Update the Unblock Linear enrollment configuration");
     await registration.service.stop?.(serviceContext(stateDir));
+  });
+
+  it("recovers after reload with replacement enrollment and uses its identity for RPC traffic", async () => {
+    const stateDir = await mkdtemp(join(tmpdir(), "unblock-linear-replacement-reload-"));
+    const firstSocket = new FakeSocket();
+    const first = createIntegrationRegistration(apiWithRuntime(runtimeFixture()), {
+      resolveSecret: async () => JSON.stringify(PRIVATE_JWK),
+      socketFactory: () => firstSocket,
+    });
+    await first.service.start(serviceContext(stateDir));
+    firstSocket.open();
+    firstSocket.message({
+      ...inboundBase(),
+      id: uuid(900),
+      type: "control",
+      payload: { kind: "device.replaced", generation: 2 },
+    });
+    await waitFor(() => expect(first.getState().statusState).toBe("device_replaced"));
+    await first.service.stop?.(serviceContext(stateDir));
+
+    const replacementConfig: OpenClawConfig = {
+      ...config,
+      channels: {
+        ...config.channels,
+        "unblock-linear": {
+          ...config.channels?.["unblock-linear"],
+          deviceId: "relay-device-2",
+          enrollmentGeneration: 2,
+        },
+      },
+    };
+    const replacementSocket = new FakeSocket();
+    const replacementSocketFactory = vi.fn(() => replacementSocket);
+    const second = createIntegrationRegistration(apiWithRuntime(runtimeFixture()), {
+      resolveSecret: async () => JSON.stringify(PRIVATE_JWK),
+      socketFactory: replacementSocketFactory,
+    });
+    const startup = second.service.start(serviceContext(stateDir, replacementConfig));
+    await waitFor(() => expect(replacementSocketFactory).toHaveBeenCalledOnce());
+    replacementSocket.open();
+    await startup;
+
+    expect(second.getState().statusState).toBe("connected");
+    expect((await RelayJournal.open(join(
+      stateDir,
+      "plugins",
+      "unblock-linear",
+      "relay-journal.json",
+    ))).getLifecycle()).toEqual({ fence: "normal" });
+    const invocation = requireTool(second).execute("replacement-rpc", {
+      action: "graphql",
+      document: "query { viewer { id } }",
+    });
+    let request: Extract<OutboundRelayFrame, { type: "rpc.request" }> | undefined;
+    await waitFor(() => {
+      request = sentFrames(replacementSocket).find((frame): frame is Extract<
+        OutboundRelayFrame,
+        { type: "rpc.request" }
+      > => frame.type === "rpc.request" && frame.deviceId === "relay-device-2");
+      expect(request).toBeDefined();
+    });
+    if (request === undefined) throw new Error("Expected replacement RPC request");
+    replacementSocket.message({
+      v: 1,
+      id: uuid(901),
+      type: "rpc.result",
+      agentId: "relay-agent",
+      deviceId: "relay-device-2",
+      timestamp: "2026-08-12T12:00:01.000Z",
+      correlationId: request.correlationId,
+      payload: { ok: true, result: { data: { viewer: { id: "me" } } } },
+    });
+    await expect(invocation).resolves.toMatchObject({ details: { data: { viewer: { id: "me" } } } });
+    await second.service.stop?.(serviceContext(stateDir, replacementConfig));
   });
 
   it("cleans up a false relay start behind a device-replaced fence", async () => {
@@ -332,7 +431,11 @@ describe("OpenClaw integration", () => {
     const pluginStateDir = join(stateDir, "plugins", "unblock-linear");
     await mkdir(pluginStateDir, { recursive: true });
     const journal = await RelayJournal.open(join(pluginStateDir, "relay-journal.json"));
-    await journal.setLifecycle("device_replaced", 2);
+    await journal.setLifecycle("device_replaced", 2, {
+      agentId: "relay-agent",
+      deviceId: "relay-device",
+      enrollmentGeneration: 1,
+    });
     const socketFactory = vi.fn(() => new FakeSocket());
     const registration = createIntegrationRegistration(apiWithRuntime(runtimeFixture()), {
       resolveSecret: async () => JSON.stringify(PRIVATE_JWK),
@@ -672,6 +775,104 @@ describe("OpenClaw integration", () => {
     await rejected;
   });
 
+  it("defers stopped-session compaction until a delayed admitted delivery settles", async () => {
+    const stateDir = await mkdtemp(join(tmpdir(), "unblock-linear-stop-ack-bind-race-"));
+    const journalPath = join(stateDir, "plugins", "unblock-linear", "relay-journal.json");
+    const socket = new FakeSocket();
+    const runtime = runtimeFixture();
+    const recordInboundSession = vi.mocked(runtime.channel.session.recordInboundSession);
+    const recordInboundSessionImplementation = recordInboundSession.getMockImplementation();
+    let releaseBinding: (() => void) | undefined;
+    const bindingReleased = new Promise<void>((resolve) => { releaseBinding = resolve; });
+    let bindingPaused: (() => void) | undefined;
+    const paused = new Promise<void>((resolve) => { bindingPaused = resolve; });
+    recordInboundSession.mockImplementation(async (input) => {
+      bindingPaused?.();
+      await bindingReleased;
+      await recordInboundSessionImplementation?.(input);
+    });
+    const registration = createIntegrationRegistration(apiWithRuntime(runtime), {
+      resolveSecret: async () => JSON.stringify(PRIVATE_JWK),
+      socketFactory: () => socket,
+    });
+    const deliveryId = uuid(72);
+
+    try {
+      await registration.service.start(serviceContext(stateDir));
+      socket.open();
+      socket.message({
+        ...inboundBase(),
+        id: uuid(172),
+        type: "delivery",
+        sessionId: "linear-session",
+        idempotencyKey: deliveryId,
+        payload: {
+          deliveryId,
+          action: "created",
+          sequence: 1,
+          teamId: "linear-team",
+          prompt: "Work",
+        },
+      });
+      await paused;
+
+      socket.message({
+        ...inboundBase(),
+        id: uuid(272),
+        type: "control",
+        sessionId: "linear-session",
+        payload: { kind: "session.stop", reason: "Stopped" },
+      });
+      socket.message({
+        ...inboundBase(),
+        id: uuid(372),
+        type: "delivery.ack",
+        sessionId: "linear-session",
+        idempotencyKey: deliveryId,
+        payload: { deliveryId, status: "canceled" },
+      });
+
+      await waitForJournalSnapshot(journalPath, (snapshot) => {
+        expect(snapshot.stoppedSessions["linear-session"]).toBe(inboundBase().timestamp);
+        expect(snapshot.deliveries[deliveryId]).toMatchObject({
+          status: "canceled",
+          terminalAcknowledged: true,
+        });
+        expect(snapshot.bindings["linear-session"]).toBeUndefined();
+      });
+      expect(sentFrames(socket)).not.toContainEqual(expect.objectContaining({
+        type: "delivery.accept",
+        payload: expect.objectContaining({ deliveryId }),
+      }));
+      expect(sentFrames(socket)).not.toContainEqual(expect.objectContaining({
+        type: "delivery.status",
+        payload: expect.objectContaining({ deliveryId, status: "started" }),
+      }));
+      expect(runtime.agent.runEmbeddedAgent).not.toHaveBeenCalled();
+      expect(socket.sentAtClose).toEqual([]);
+
+      releaseBinding?.();
+      await waitForJournalSnapshot(journalPath, (snapshot) => {
+        expect(snapshot.deliveries[deliveryId]).toBeUndefined();
+        expect(snapshot.bindings["linear-session"]).toBeUndefined();
+        expect(snapshot.stoppedSessions).toEqual({});
+      });
+      expect(sentFrames(socket)).not.toContainEqual(expect.objectContaining({
+        type: "delivery.accept",
+        payload: expect.objectContaining({ deliveryId }),
+      }));
+      expect(sentFrames(socket)).not.toContainEqual(expect.objectContaining({
+        type: "delivery.status",
+        payload: expect.objectContaining({ deliveryId, status: "started" }),
+      }));
+      expect(runtime.agent.runEmbeddedAgent).not.toHaveBeenCalled();
+      expect(socket.sentAtClose).toEqual([]);
+    } finally {
+      releaseBinding?.();
+      await registration.service.stop?.(serviceContext(stateDir));
+    }
+  });
+
   it.each([
     ["session", { sessionId: "linear-session", payload: { kind: "session.stop" } }],
     ["team", { payload: { kind: "team.access_removed", teamId: "linear-team" } }],
@@ -718,6 +919,16 @@ describe("OpenClaw integration", () => {
       ...control,
     });
     await waitFor(() => expect(observedSignal?.aborted).toBe(true));
+    let stopped = false;
+    if (kind === "session") {
+      await registration.service.stop?.(serviceContext(stateDir));
+      stopped = true;
+      const journal = await RelayJournal.open(
+        join(stateDir, "plugins", "unblock-linear", "relay-journal.json"),
+      );
+      expect(journal.snapshot().stoppedSessions["linear-session"])
+        .toBe("2026-08-12T12:00:00.000Z");
+    }
     if (kind === "terminal") {
       await waitFor(() => expect(registration.getState().statusState).toBe("revoked"));
       await waitFor(() => expect(socket.sentAtClose).toHaveLength(1));
@@ -744,6 +955,6 @@ describe("OpenClaw integration", () => {
         }),
       }));
     }
-    await registration.service.stop?.(serviceContext(stateDir));
+    if (!stopped) await registration.service.stop?.(serviceContext(stateDir));
   });
 });

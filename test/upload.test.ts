@@ -98,6 +98,26 @@ describe("managed Linear upload", () => {
     );
   });
 
+  it("deduplicates a completed upload only for the same lifecycle owner", async () => {
+    const deps = await dependencies({
+      size: 1,
+      stream: async () => stream(new Uint8Array([1])),
+    });
+    const owned = {
+      ...input,
+      deliveryId: "delivery-1",
+      sessionId: "linear-session",
+    };
+
+    await executeManagedUpload(owned, deps);
+    await expect(executeManagedUpload(owned, deps)).resolves.toEqual({
+      assetUrl: "https://uploads.linear.app/asset/opaque",
+    });
+    expect(deps.fetch.put).toHaveBeenCalledOnce();
+    await expect(executeManagedUpload({ ...owned, deliveryId: "delivery-2" }, deps))
+      .rejects.toMatchObject({ code: "invalid_media" });
+  });
+
   it("rejects a managed file over 25 MiB before requesting an upload destination", async () => {
     const deps = await dependencies({
       size: MAX_LINEAR_UPLOAD_BYTES + 1,

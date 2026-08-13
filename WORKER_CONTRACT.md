@@ -2,33 +2,37 @@
 
 ## Purpose
 
-This is the implementation handoff for a fresh Codex session building the
-external OpenClaw plugin. It describes the contract that is implemented and
-live-tested by the Cloudflare Worker as of 2026-08-12.
+This document records the current contract between the OpenClaw plugin and the
+Cloudflare Worker working trees as of 2026-08-12. It is an implementation and
+operations reference, not proof that either configured origin is currently
+running these exact working trees. Verify deployed versions and live acceptance
+separately before release.
 
 The intended product boundary is:
 
 ```text
 Linear     owns OAuth scopes, resource access, authorization, and workspace truth
-Cloudflare owns Linear credentials, authenticated transport, durability, and replay
-OpenClaw   owns agent execution, the model-facing Linear tool, and conversation state
+Cloudflare owns Linear credentials plus relay-side transport, durability, and replay
+OpenClaw   owns agent execution, conversation state, and the plugin's local replay journal
 ```
 
 The plugin must make Linear feel like a normal agent integration. Relay concepts
 such as Durable Objects, delivery IDs, device generations, request correlation,
 and retries must not be exposed to the model.
 
-The minimum supported OpenClaw version is `2026.7.2`.
+The minimum supported OpenClaw version is `2026.7.2-beta.7`.
 
-## Current deployment and source of truth
+## Configured origins and source of truth
 
 - Staging origin: `https://linear-staging.unblocklabs.ai`
 - Staging WebSocket: `wss://linear-staging.unblocklabs.ai/v1/relay/agents/{agentId}/devices/{deviceId}/ws`
 - Production origin: `https://linear.unblocklabs.ai`
 - Production WebSocket: `wss://linear.unblocklabs.ai/v1/relay/agents/{agentId}/devices/{deviceId}/ws`
 - Protocol version: `1`
-- Live-tested staging Worker version: `4995bc64-4b47-4b81-b7ce-3ffc341dfacf`
-- Production has not yet been updated to this contract.
+
+The Worker Wrangler configurations target these origins. The repositories do
+not establish which Worker version is currently deployed at either origin, so
+this contract makes no deployment-parity or live-test claim.
 
 The authoritative Worker checkout is:
 
@@ -40,17 +44,26 @@ Read these files before implementation and treat them as more authoritative
 than prose if the code changes:
 
 ```text
-scope.md                         product and authority boundary
+scope.md                         product boundary only; implementation/test details may be stale
 src/protocol/relay.ts            exact frame runtime schema and byte bounds
 src/security/device-auth.ts      exact signed-upgrade authentication
 src/agent-relay-do.ts            durable lifecycle, replay, and control behavior
-scripts/relay-simulator.mjs      known-good reference client
-src/simulator/private-replay.ts  reference crash-safe replay journal
+src/http/router.ts               public routes, webhook/OAuth flow, and relay upgrade
+src/http/provisioning-admin.ts   current operator provisioning API
+src/registry/                    provisioning and enrollment persistence
+scripts/bootstrap-production.mjs reservation/completion operator client
+
+# In this plugin checkout:
+src/relay/journal.ts             crash-safe local replay and lifecycle journal
+src/relay/service.ts             authenticated WebSocket lifecycle and replay
+src/delivery/                    OpenClaw session binding, execution, and recovery
+src/linear/                      GraphQL RPC, tool, and guarded upload behavior
+src/integration.ts               OpenClaw service, journal, and executor wiring
 ```
 
-Do not invent a second protocol package in v1. Vendor the small protocol-v1
-runtime schema into the plugin, record its Worker provenance, and add parity
-fixtures. Recheck the Worker schema before release.
+The plugin vendors the small protocol-v1 runtime schema with its Worker
+provenance and parity fixtures. Do not introduce a second protocol package in
+v1; compare the vendored body with the Worker schema before release.
 
 ## Plugin responsibilities
 
@@ -60,13 +73,14 @@ The plugin owns only:
 2. Resolution of an enrolled P-256 private key through an OpenClaw SecretRef.
 3. Signed WebSocket upgrades and bounded reconnect.
 4. Runtime validation of every inbound and outbound frame.
-5. Durable local ownership of deliveries, activities, and unresolved RPCs.
+5. Durable local ownership of deliveries, activities, unresolved RPCs, and
+   managed upload workflows.
 6. Linear AgentSession to OpenClaw session continuity.
 7. Translation of OpenClaw progress/final output into Linear Agent Activities.
 8. A model-facing `linear` tool backed by the private `linear.graphql` method.
 9. Cancellation/abort handling for control frames.
 10. A plugin-owned reconnect CLI for explicit recovery after OAuth revocation.
-11. Content-free health and doctor diagnostics.
+11. Content-free channel status and configuration-only doctor warnings.
 
 The plugin does **not** own:
 
@@ -85,7 +99,8 @@ GraphQL endpoint.
 
 ## Required plugin configuration
 
-The runtime needs an already-enrolled device bundle:
+The runtime configuration lives under `channels.unblock-linear` and needs one
+already-enrolled device bundle:
 
 ```ts
 type UnblockedLinearPluginConfig = {
@@ -100,30 +115,56 @@ type UnblockedLinearPluginConfig = {
 The corresponding public JWK and generation are already stored in the Worker
 registry. The private JWK stays on the OpenClaw host.
 
-For staging validation, the existing enrolled staging test device in the
-authoritative Worker checkout may be used. Its private key is test input only:
-never copy it into plugin source, package contents, fixtures, logs, or commits.
+For staging validation, provision a dedicated enrolled device through the
+operator API. Keep its private key outside both repositories and never copy it
+into plugin source, package contents, fixtures, logs, or commits.
 
 The plugin must not embed or request:
 
-- `CONTROL_API_TOKEN`;
+- `ADMIN_API_TOKEN`;
 - a Linear access/refresh token;
 - the Linear OAuth client secret;
 - the Linear webhook signing secret;
 - the Cloudflare control-plane key.
 
-The staging-only `/_test/v1/bootstrap` endpoint is an operator provisioning
-tool, not a plugin API, and is structurally absent from production. The current
-production Worker does not expose a device self-registration endpoint. The
-plugin therefore consumes an enrollment bundle supplied by the operator; do not
-add registration to the plugin without a separate control-plane contract.
+Provisioning is an operator-only, two-step API authenticated with
+`Authorization: Bearer <ADMIN_API_TOKEN>`:
+
+1. `POST /v1/admin/agents/reservations` accepts an idempotency key, display
+   name, agent, installation, organization, device ID, and public P-256 JWK. It
+   creates a 15-minute reservation and returns its opaque ID, webhook route and
+   URL, expiry, and exact completion URL.
+2. `POST /v1/admin/agents/reservations/{reservationId}/complete` supplies the
+   Linear OAuth client ID and scopes plus the OAuth client secret and webhook
+   secret. The Worker encrypts the two secrets, stores the client ID and
+   normalized scopes, creates or enables the installation record, and activates
+   the reserved device. It returns the installation details and an
+   `oauthStartUrl`; webhook delivery remains not-ready until OAuth completes.
+3. An operator follows `oauthStartUrl`; the callback at
+   `/v1/linear/oauth/callback` verifies the Linear identity, stores the OAuth
+   token bundle, marks the installation ready for webhook delivery, then
+   initializes and restores the relay.
+
+The operator may drive this flow with `scripts/bootstrap-production.mjs`. The
+private device JWK is generated and retained outside the Worker; only its public
+JWK is reserved. The current reservation/completion responses do not return the
+private key or assigned `enrollmentGeneration`; provisioning automation must
+retain the private key and provide the assigned generation to the OpenClaw
+configuration separately.
+
+These admin endpoints are not plugin APIs. The staging and production Worker
+entrypoints wire the same routes behind each deployment's respective
+`ADMIN_API_TOKEN` binding; source alone does not prove live reachability. There
+is no device self-registration endpoint. The plugin therefore consumes an
+enrollment bundle supplied by the operator; do not add registration to the
+plugin without a separate control-plane contract.
 
 ## OpenClaw channel routing and execution
 
-Implement this as an OpenClaw channel plugin named `unblock-linear`, with the
+This is implemented as an OpenClaw channel plugin named `unblock-linear`, with the
 long-lived relay service and model-facing `linear` tool registered by the same
-plugin. Use `defineChannelPluginEntry` and the supported channel inbound/session
-pipeline rather than inventing a parallel agent runner.
+plugin. It uses `defineChannelPluginEntry` and the supported channel
+inbound/session pipeline rather than a parallel agent runner.
 
 The configured `agentId` above is only the authenticated Worker relay identity.
 It is not an OpenClaw agent selector. Do not add an `openclawAgentId` setting and
@@ -132,19 +173,10 @@ OpenClaw agent through normal channel/account bindings, with OpenClaw's normal
 default-agent behavior when no explicit binding exists. This keeps agent
 routing, workspace, model, and tool policy in OpenClaw's existing configuration.
 
-For each Linear AgentSession, build one stable OpenClaw route/session target and
-reuse it for every delivery in that Linear session. Follow the supported
-`sessionTarget` plus `runEmbeddedAgent` pattern used by the working Loggie
-channel plugin at:
-
-```text
-/Users/bek/Desktop/openclaw-plugins/loggie
-```
-
-Use Loggie only as a reference for current OpenClaw channel dispatch, stable
-session targeting, abort signals, runtime loading, packaging, and tests. The
-sibling `/Users/bek/Desktop/openclaw-plugins/unblock-linear` checkout is a failed
-attempt and is not an implementation reference.
+For each Linear AgentSession, `src/delivery/executor.ts` persists one stable
+OpenClaw route/session target and reuses it for every delivery in that Linear
+session. Execution uses the supported `sessionTarget` plus `runEmbeddedAgent`
+path with an abort signal and the selected agent's normal runtime policy.
 
 Linear-originated runs inherit the selected OpenClaw agent's full effective tool
 policy. Do not restrict them to the `linear` tool: a Linear task may legitimately
@@ -255,7 +287,10 @@ type BaseFrame = {
 ```
 
 Validate every frame before acting. Also verify that inbound `agentId` and
-`deviceId` match the configured connection identity. A malformed or
+`deviceId` match the configured connection identity. The only identity exception
+is a same-agent `device.replaced` control whose generation is strictly newer
+than the connected enrollment: the Worker stamps that control with the
+replacement device ID before closing the old socket. Any other malformed or
 identity-mismatched device frame closes the connection with code `1008`; an
 oversized frame closes with `1009`.
 
@@ -267,8 +302,9 @@ plugin -> Worker: delivery.accept, delivery.status, activity, rpc.request
 ```
 
 The plugin must be prepared to receive restored controls, pending RPC results,
-an accepted/started delivery replay, and the next queued delivery immediately
-after connection. Do not depend on an application-level handshake frame.
+an accepted/started delivery replay, delivery-status acknowledgements, and the
+next eligible queued delivery immediately after connection. Do not depend on an
+application-level handshake frame.
 
 ## Delivery and OpenClaw session binding
 
@@ -300,7 +336,8 @@ Required behavior:
 3. For `prompted`, reuse the existing binding. The Worker normally supplies
    `payload.openclawSessionId`; never create a new conversation for a follow-up.
 4. Treat an exact repeated `deliveryId` as resume/replay, not new user intent.
-5. Execute only one active delivery at a time for this plugin/device version.
+5. Execute only one active delivery at a time in the plugin service; the Worker
+   also serializes delivery per Agent Durable Object.
 6. Resolve the selected OpenClaw agent through normal channel routing and run the
    delivery through a stable `sessionTarget` using the supported embedded-agent
    runtime.
@@ -405,6 +442,7 @@ Use an `activity` frame for native Linear AgentSession progress:
 type AgentActivity =
   | { type: "thought"; body: string; ephemeral?: boolean }            // body <= 4,000
   | { type: "action"; action: string; parameter: string; result?: string; ephemeral?: boolean }
+      // action <= 256; parameter <= 2,000; optional result <= 4,000
   | { type: "elicitation"; body: string }                             // body <= 8,000
   | { type: "response"; body: string }                                // body <= 32,000
   | { type: "error"; body: string };                                  // body <= 8,000
@@ -478,7 +516,9 @@ type LinearGraphqlRpc = BaseFrame & {
 Constraints:
 
 - The GraphQL document must be nonempty and at most 48,000 UTF-8 bytes.
-- The complete persisted request is at most 60 KiB.
+- The canonical semantic request payload accepted for persistence is at most
+  60 KiB, covering `contextId`, optional `sessionId` and `operationName`, the
+  document, and canonical variables.
 - Variables must be a JSON object, not an array or scalar.
 - One request selects exactly one query or mutation.
 - Fragments are allowed.
@@ -569,7 +609,8 @@ Error handling:
 - `invalid_request`: fix the document, selection, variables, or size; do not reconnect.
 - `conflict`: the same idempotency key was reused for different semantic input;
   treat this as a plugin bug and mint a new key only for genuinely new intent.
-- `unauthorized`: installation/session control is active; do not retry until state changes.
+- `unauthorized`: an installation, team, or session control is active; do not
+  retry until state changes.
 - `outcome_unknown`: a mutation may have reached Linear. Never resend it under a
   new identity. Reconcile with a follow-up query.
 - Other failures: obey the explicit `retryable` boolean.
@@ -593,7 +634,8 @@ exact variables
 full validated frame
 ```
 
-Do not put those contents in ordinary logs or operator transcripts.
+Do not put those contents in plugin logs, channel status, doctor output, or
+reconnect errors.
 
 The Worker's durable request identity is the `idempotencyKey`. Its semantic hash
 includes `contextId`, optional Linear `sessionId`, optional `operationName`, the
@@ -613,12 +655,22 @@ proof the plugin received the result. Therefore:
 5. Delete/compact the local replay entry only after the result is durably handed
    to its owning OpenClaw tool invocation, or after a control terminally cancels it.
 
-Use one small private replay journal with restrictive permissions and a fixed
-entry bound. The simulator's implementation uses atomic temp-file replacement,
-mode `0600`, validates before persistence, and never places documents,
-variables, prompts, activity bodies, or results in its operator transcript.
-Journal exhaustion must fail closed: reject new work with a content-free error
-rather than evicting or overwriting any unresolved delivery, activity, or RPC.
+The plugin implements this with
+`plugins/unblock-linear/relay-journal.json` under the OpenClaw state directory
+and a sibling single-writer lease owned by `RelayService`. The journal validates
+its complete state before persistence, writes through a mode-`0600` temporary
+file, syncs it, and atomically renames it into place. `RelayService` persists
+replayable work before sending and replays unresolved activity, delivery-status,
+and RPC frames in journal sequence after reconnect.
+
+The ordinary journal capacity is 256 entries and 4 MiB. Durable stopped-session
+markers are a separate control overlay so a stop can still persist at ordinary
+capacity; every marker must correspond to a retained delivery, which bounds the
+overlay by the delivery count. Journal exhaustion must fail closed rather than
+evicting or overwriting unresolved work. An incompatible or corrupt journal is
+rejected; there is intentionally no schema migration or backward compatibility.
+The host-private relay journal and OpenClaw conversation transcript intentionally
+persist content required for replay and recovery.
 
 ## Control frames
 
@@ -627,7 +679,7 @@ type ControlPayload =
   | { kind: "session.stop"; reason?: string }
   | { kind: "team.access_removed"; teamId: string }
   | { kind: "installation.revoked" }
-  | { kind: "device.replaced"; generation: number };
+  | { kind: "device.replaced"; generation: number }; // nonnegative in protocol; enrolled generations are positive
 ```
 
 Behavior:
@@ -635,7 +687,11 @@ Behavior:
 - `session.stop`: abort the matching OpenClaw run and cancel its unresolved
   session-scoped RPCs. The Worker permits at most one best-effort final
   `response` or `error` activity after stop; then send `delivery.status` as
-  `canceled`.
+  `canceled`. If the session has retained delivery state, the plugin persists
+  its bounded stopped marker before cleanup; otherwise it compacts retained
+  binding and RPC state without keeping a marker. It always attempts the local
+  abort even if journal persistence fails; a persistence failure still closes
+  the socket fail-closed.
 - `team.access_removed`: promptly cancel known affected active Linear sessions.
   This is an operational signal, not a Cloudflare authorization rule for future
   generic GraphQL; Linear remains authoritative.
@@ -645,12 +701,19 @@ Behavior:
   restarts.
 - `device.replaced`: stop using the old generation and require a newly supplied
   enrollment bundle. Persist the replacement fence and do not reconnect with the
-  stale key/generation.
+  stale key/generation. The fence records the old enrollment identity and a
+  generation floor: the control payload generation when a control was received,
+  or the attempted configured generation for an exact stale-upgrade `409`. Only
+  a compatible updated configuration can probe.
 
-When an enrolled generation rotates while connected, the Worker sends
-`control.device.replaced` before closing the old socket with code `4001`. A stale
-generation presented during a new signed upgrade receives content-free HTTP
-`409 {"error":"device_replaced"}`; other authentication failures remain generic.
+When an enrolled generation rotates while connected, the Worker attempts to
+send `device.replaced`, stamped with the replacement device identity, before
+closing the old socket with code `4001`. The plugin drains already-queued inbound
+frames before finalizing the close so a successfully queued control cannot be
+lost to the immediate close. For an otherwise active device, a stale generation
+presented during a new signed upgrade receives content-free HTTP
+`409 {"error":"device_replaced"}`; other signed-authentication failures remain
+generic.
 
 Controls can arrive immediately on reconnect. Apply them before resuming work.
 
@@ -659,12 +722,13 @@ Controls can arrive immediately on reconnect. Apply them before resuming work.
 - Use bounded exponential backoff with jitter for abnormal network closes.
 - Generate new signed-upgrade authentication for every attempt.
 - Do not automatically reconnect after an intentional plugin shutdown,
-  installation revocation, or device replacement with a newer generation. The
-  only revocation exceptions are the explicit CLI attempt and the single startup
-  attempt defined below; neither may bypass a device-replacement fence.
+  installation revocation, or device replacement while the same enrollment is
+  configured. Revocation permits only the explicit CLI attempt and the single
+  startup attempt defined below. Device replacement permits only the compatible
+  updated-enrollment startup probe defined below; the CLI never bypasses it.
 - A new successful connection replaces the old socket; never operate both.
-- On reconnect, replay exact unresolved local activity and RPC frames in durable
-  insertion order.
+- On reconnect, replay exact unresolved local activity, delivery-status, and RPC
+  frames in durable insertion order.
 - If the Worker reoffers an accepted/started delivery, attach to the same local
   OpenClaw session and apply the process-crash recovery policy above; do not
   create a second conversation.
@@ -692,7 +756,15 @@ APIs. Its behavior is:
 On OpenClaw startup, perform one fresh signed connection attempt even when the
 persisted state is `installation.revoked`. Success clears the revoked state;
 failure leaves the service revoked and requires the explicit reconnect command.
-Startup must still refuse a stale device generation after `device.replaced`.
+
+For a persisted `device.replaced` fence, startup refuses unchanged, rollback,
+and cross-agent configuration without opening a socket. If configuration has
+changed to a same-agent enrollment whose generation is not below the fenced
+replacement generation, startup makes one authenticated probe. Only a
+WebSocket `open` activates it: replay and stored RPC frame device IDs are
+atomically rebound to the configured device before the fence clears and replay
+begins. A failed probe or activation keeps the replacement fence and does not
+retry automatically.
 
 ## Files and attachments
 
@@ -711,10 +783,16 @@ For upload parity:
 2. Call Linear's `fileUpload` mutation through `linear.graphql`.
 3. Require an HTTPS upload destination and validate that it is the exact
    pre-signed destination returned by Linear. Do not accept a caller-supplied URL.
-4. Stream the managed file directly to that destination using exactly the
-   headers Linear returned. Do not load the whole file into memory.
+4. Stream the managed file directly to that destination using the bounded
+   headers Linear returned plus the approved `Content-Type` and exact
+   `Content-Length`. Reject conflicting returned values, block redirects, and
+   verify the stream emits exactly the approved size. Do not load the whole file
+   into memory.
 5. Return the resulting Linear asset URL from the tool.
 6. Let the agent use that URL in a normal `graphql` action mutation.
+
+Once an upload PUT begins, a transport error, size mismatch, redirect, or
+non-2xx response is persisted as `ambiguous` and is not retried automatically.
 
 For downloads, GraphQL responses contain short-lived Linear-signed file URLs.
 The Worker fixes `public-file-urls-expire-in` to 300 seconds. Do not add a
@@ -744,44 +822,49 @@ Never log:
 - Agent Activity bodies;
 - raw OpenClaw prompts or hidden reasoning.
 
-The doctor command should prove only configuration presence, key parseability,
-clock sanity, endpoint reachability, signed connection status, generation, and
-bounded state counts.
+The status adapter emits content-free configured state and can map a
+host-supplied runtime snapshot into running, connected, lifecycle, and timestamp
+fields. The current relay service does not publish its live `IntegrationState`
+or start/stop timestamps into OpenClaw's channel runtime snapshot. Doctor
+preview warnings report only disabled accounts and missing or invalid
+configuration field names. Doctor does not resolve the secret, open a socket,
+inspect journal content, or claim endpoint/authentication health.
 
 ## Minimal OpenClaw implementation shape
 
 Use the current supported focused `openclaw/plugin-sdk` entry points; do not
 patch OpenClaw core or import private internals.
 
-The smallest useful plugin has:
+The current focused implementation has:
 
 ```text
-package.json               declares OpenClaw >=2026.7.2 and channel metadata
+package.json               declares OpenClaw >=2026.7.2-beta.7 and channel metadata
 openclaw.plugin.json       declares the channel, linear tool, and startup activation
 index.ts                   defineChannelPluginEntry and thin registrations only
-setup-entry.ts             setup-safe channel/CLI metadata when required by the SDK
-src/channel.ts             channel account, status, routing, and inbound surface
-src/config.ts              config parsing plus SecretRef resolution boundary
+setup-entry.ts             setup-safe channel metadata
+src/channel.ts             channel account, status, doctor, and secret metadata
+src/config.ts              channel-root config parsing and SecretRef boundary
+src/integration.ts         service/tool wiring, media resolution, and reconnect state
+src/reconnect.ts           CLI and operator-write Gateway method
 src/relay/protocol.ts      vendored exact protocol-v1 Zod schema
 src/relay/device-auth.ts   canonical signing
-src/relay/client.ts        one socket, reconnect, routing, controls
+src/relay/service.ts       one socket, reconnect, replay, and controls
 src/relay/journal.ts       bounded private exact replay state
-src/service.ts             OpenClaw startup/shutdown lifecycle
-src/cli.ts                 reconnect command -> plugin-owned Gateway method
-src/tool.ts                graphql/upload actions -> linear.graphql RPC and guarded media upload
-src/sessions.ts            channel routing, stable session target, recovery, and abort mapping
+src/relay/lease.ts         single-writer journal ownership
+src/delivery/              session routing, execution, recovery, and abort mapping
+src/linear/                graphql/upload tool, RPC bridge, and guarded media upload
 test/                      protocol, replay, control, tool, and runtime tests
 ```
 
 Use the supported channel entrypoint and inbound pipeline, `registerService` for
 the long-lived relay connection, `registerTool` for the `linear` tool,
 `registerGatewayMethod` for the reconnect operation, and `registerCli` for the
-operator command, subject to the exact OpenClaw 2026.7.2 SDK. Keep entrypoint
+operator command, subject to the exact OpenClaw 2026.7.2-beta.7 SDK. Keep entrypoint
 registration thin. Do not add a provider-neutral transport layer, configurable
 scheduler, multiple-device manager, generic job framework, or mirrored Linear
 SDK/schema.
 
-The package and manifest must align. Add `@openclaw/plugin-inspector` and prove:
+The package and manifest align, and `npm run preflight` covers:
 
 ```text
 typecheck/build
@@ -789,8 +872,11 @@ unit tests
 cold manifest inspection
 runtime inspection with the mock SDK
 npm pack --dry-run
-installed local Gateway smoke test
 ```
+
+An installed local Gateway smoke test and authenticated staging acceptance are
+separate release checks; the mock-runtime inspector and repository tests do not
+prove either one.
 
 ## Required validation before release
 
@@ -813,7 +899,8 @@ installed local Gateway smoke test
 15. Disconnect after request send but before result consumption; restart replays
     the exact frame and resolves the original invocation.
 16. Journal capacity exhaustion fails closed without evicting unresolved work or
-    leaking persisted content.
+    leaking persisted content, while a `session.stop` at the ordinary entry or
+    byte limit still persists its bounded marker and aborts active work.
 17. A completed transcript result is recovered after restart without rerunning
     the prompt.
 18. An incomplete delivery with no tool execution resumes in the same session.
@@ -826,8 +913,10 @@ installed local Gateway smoke test
 23. `openclaw unblock-linear reconnect` makes one attempt, clears revocation only
     on success, and returns a content-free failure otherwise.
 24. OpenClaw restart makes one connection attempt from revoked state.
-25. Device replacement fences the old generation and the reconnect command
-    refuses it until enrollment configuration changes.
+25. Device replacement fences the old enrollment, drains control-before-close,
+    and makes the reconnect command refuse it. After configuration changes, only
+    a compatible same-agent startup probe may clear the fence after authenticated
+    open and atomic replay/RPC identity rebinding.
 26. A managed `media://inbound/<opaque-id>` file uploads through Linear's
     `fileUpload` flow and returns the asset URL.
 27. Paths, arbitrary URLs, malformed references, and files over 25 MiB are
@@ -837,27 +926,51 @@ installed local Gateway smoke test
     `Content-Length` required by Linear's signed upload destination; reject
     conflicts. File bytes never enter the WebSocket protocol.
 29. Mutation `outcome_unknown` is not automatically replayed and triggers query reconciliation.
-30. Operator logs/transcripts contain none of the sensitive fields listed above.
-31. Cold and live OpenClaw plugin inspection match the manifest.
+30. Plugin logs, channel status, doctor output, and reconnect errors contain none
+    of the sensitive fields listed above.
+31. Cold and mock-runtime OpenClaw plugin inspection match the manifest.
 
-The simulator is disabled. Staging validation uses the enrolled test device;
-production remains a separate, explicitly authorized release step.
+Staging validation requires an operator-provisioned enrolled device with the
+plugin's `RelayService` and `RelayJournal`. No authenticated live staging result
+is established by the current repositories; production provisioning and release
+remain separate, explicitly authorized steps.
 
 ## Known current limits
 
 - One active device generation per logical agent.
 - Serial delivery execution per Agent Durable Object.
+- Each authorized delivery receives a deadline 10 minutes after ingress. If it
+  remains authorized when that deadline is processed and no device socket is
+  connected, the Worker marks it failed and queues a user-visible Linear error
+  activity instead of offering stale work later.
 - 64 KiB maximum WebSocket frame.
 - 48,000-byte GraphQL document and result bounds.
+- 60 KiB maximum canonical GraphQL request payload accepted for persistence,
+  covering `contextId`, optional `sessionId` and `operationName`, the document,
+  and canonical variables.
+- 256 ordinary plugin journal entries and 4 MiB ordinary serialized journal
+  state, plus the delivery-bounded stopped-session control overlay.
+- A Linear session binding remains durable until an explicit `session.stop`;
+  many distinct sessions that never receive that control can exhaust journal
+  capacity and fail closed.
 - No GraphQL subscriptions.
 - No reusable Linear OAuth credential on the OpenClaw host.
 - Managed uploads are limited to 25 MiB and `media://inbound/<opaque-id>` sources.
-- No production self-enrollment API yet.
+- Completed delivery-owned uploads compact with their acknowledged terminal
+  delivery. Generic completed uploads outside a delivery have no trustworthy
+  lifecycle endpoint and can eventually exhaust journal capacity; they are
+  retained fail-closed. Pending, uploading, failed, and ambiguous upload state is
+  also retained rather than guessed or evicted.
+- No device self-registration API; enrollment is operator-only through the
+  authenticated admin reservation/completion flow.
+- The current provisioning responses do not expose the assigned enrollment
+  generation, so provisioning automation must provide it separately.
+- No journal backward compatibility or migration; incompatible prior state is
+  rejected intentionally.
 - No exactly-once guarantee for arbitrary Linear mutations; ambiguous outcomes
   are terminal `outcome_unknown` and require reconciliation.
 - No exactly-once guarantee for arbitrary non-Linear OpenClaw tool side effects;
   crash recovery inspects and reconciles before repeating ambiguous work.
-- Production has not yet received the staging-validated generic GraphQL build.
 
-These limits are intentional. Do not broaden the architecture while building
+These limits are intentional. Do not broaden the architecture while operating
 the first plugin unless a real acceptance test requires it.

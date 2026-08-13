@@ -65,7 +65,7 @@ describe("plugin entrypoints", () => {
     const devDependencies = packageJson.devDependencies as Record<string, unknown>;
 
     expect(metadata.runtimeExtensions).toEqual(["./dist/index.js"]);
-    expect(peerDependencies.openclaw).toBe(">=2026.7.2");
+    expect(peerDependencies.openclaw).toBe(">=2026.7.2-beta.7");
     expect(devDependencies.openclaw).toBe("2026.7.2-beta.7");
     expect(build.openclawVersion).toBe("2026.7.2-beta.7");
   });
