@@ -1,6 +1,6 @@
 {
   "name": "@unblocklabs/unblock-linear",
-  "version": "0.2.0",
+  "version": "0.2.1",
   "description": "Native Linear AgentSession channel for OpenClaw.",
   "type": "module",
   "main": "./dist/index.js",
