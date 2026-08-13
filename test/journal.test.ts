@@ -81,6 +81,14 @@ function acknowledgementFrame(
   };
 }
 
+function terminalStatus(id: number, deliveryId: string, sessionId: string): DeliveryStatusFrame {
+  return { ...statusFrame(id, deliveryId, "completed"), sessionId };
+}
+
+function terminalAcknowledgement(id: number, deliveryId: string, sessionId: string): DeliveryAcknowledgementFrame {
+  return { ...acknowledgementFrame(id, deliveryId, "completed"), sessionId };
+}
+
 function resultFrame(
   request: RpcFrame,
   payload: RpcResultFrame["payload"] = { ok: true, result: { data: { viewer: { id: "me" } } } },
@@ -143,7 +151,11 @@ async function journalFixture(options: RelayJournalOptions = {}) {
 describe("RelayJournal", () => {
   it("atomically persists and reloads the complete v1 state with restrictive permissions", async () => {
     const { path, journal } = await journalFixture();
-    await journal.setLifecycle("device_replaced", 2);
+    await journal.setLifecycle("device_replaced", 2, {
+      agentId: "agent",
+      deviceId: "device",
+      enrollmentGeneration: 1,
+    });
     await journal.bindSession(binding());
     await journal.recordDelivery(delivery());
     await journal.addReplay({ key: "activity-1", kind: "activity", deliveryId: "delivery-1", frame: frame(1) });
@@ -153,6 +165,52 @@ describe("RelayJournal", () => {
     expect(reloaded.snapshot()).toMatchObject({ lifecycle: { fence: "device_replaced", generation: 2 }, replay: [{ key: "activity-1" }] });
     expect((await stat(path)).mode & 0o777).toBe(0o600);
     await expect(readFile(`${path}.tmp`)).rejects.toMatchObject({ code: "ENOENT" });
+  });
+
+  it("atomically rebinds replacement replay and RPC identities before clearing the fence", async () => {
+    const { path, journal } = await journalFixture();
+    const request = frame(10, "rpc.request");
+    await journal.recordRpcInvocation("tool-call", fingerprint(), request);
+    await journal.recordRpcResult(resultFrame(request));
+    await journal.addReplay({ key: "activity", kind: "activity", deliveryId: "delivery-1", frame: frame(11) });
+    await journal.setLifecycle("device_replaced", 2, {
+      agentId: "agent",
+      deviceId: "device",
+      enrollmentGeneration: 1,
+    });
+
+    await journal.activateReplacement({
+      agentId: "agent",
+      deviceId: "replacement-device",
+      enrollmentGeneration: 2,
+    });
+
+    const reloaded = await RelayJournal.open(path);
+    expect(reloaded.getLifecycle()).toEqual({ fence: "normal" });
+    expect(reloaded.getReplayEntries().every((entry) => entry.frame.deviceId === "replacement-device"))
+      .toBe(true);
+    expect(reloaded.getRpcInvocation("tool-call")).toMatchObject({
+      request: { deviceId: "replacement-device" },
+      result: { deviceId: "replacement-device" },
+    });
+  });
+
+  it("rejects cross-agent replacement activation without changing fenced state", async () => {
+    const { journal } = await journalFixture();
+    await journal.addReplay({ key: "activity", kind: "activity", deliveryId: "delivery-1", frame: frame(1) });
+    await journal.setLifecycle("device_replaced", 2, {
+      agentId: "agent",
+      deviceId: "device",
+      enrollmentGeneration: 1,
+    });
+    const before = journal.snapshot();
+
+    await expect(journal.activateReplacement({
+      agentId: "other-agent",
+      deviceId: "replacement-device",
+      enrollmentGeneration: 2,
+    })).rejects.toBeInstanceOf(JournalError);
+    expect(journal.snapshot()).toEqual(before);
   });
 
   it("keeps the primary authoritative and discards stale or corrupt temporary state", async () => {
@@ -203,6 +261,15 @@ describe("RelayJournal", () => {
     await journal.addReplay({ key: "activity-1", kind: "activity", deliveryId: "delivery-1", frame: frame(1) });
     const persisted = JSON.parse(await readFile(path, "utf8")) as { nextSequence: number };
     persisted.nextSequence = 1;
+    await writeFile(path, JSON.stringify(persisted), { mode: 0o600 });
+
+    await expect(RelayJournal.open(path)).rejects.toMatchObject({ message: "Journal state is corrupt" });
+  });
+
+  it("rejects a stopped-session marker without a retained delivery", async () => {
+    const { path } = await journalFixture();
+    const persisted = JSON.parse(await readFile(path, "utf8")) as { stoppedSessions: Record<string, string> };
+    persisted.stoppedSessions["orphaned-session"] = "2026-08-12T12:00:01.000Z";
     await writeFile(path, JSON.stringify(persisted), { mode: 0o600 });
 
     await expect(RelayJournal.open(path)).rejects.toMatchObject({ message: "Journal state is corrupt" });
@@ -388,6 +455,43 @@ describe("RelayJournal", () => {
     expect(journal.getDelivery("delivery-1")).toBeUndefined();
   });
 
+  it("persists the stopped-session overlay beyond byte capacity and compacts it after reload", async () => {
+    const { path, journal } = await journalFixture();
+    const deliveryId = uuid(3_000);
+    await journal.recordDelivery({ ...delivery(deliveryId), status: "started" });
+    const ordinarySize = Buffer.byteLength(await readFile(path, "utf8"));
+    const bounded = await RelayJournal.open(path, { maxBytes: ordinarySize });
+
+    await bounded.markSessionStopped("linear-session", "2026-08-12T12:00:01.000Z");
+    expect(Buffer.byteLength(await readFile(path, "utf8"))).toBeGreaterThan(ordinarySize);
+
+    const reloaded = await RelayJournal.open(path, { maxBytes: ordinarySize });
+    expect(reloaded.snapshot().stoppedSessions).toEqual({
+      "linear-session": "2026-08-12T12:00:01.000Z",
+    });
+    await reloaded.acknowledgeAndCompactDeliveryStatus(
+      acknowledgementFrame(3_001, deliveryId, "canceled"),
+    );
+    expect(reloaded.getDelivery(deliveryId)).toBeUndefined();
+    expect(reloaded.snapshot().stoppedSessions).toEqual({});
+  });
+
+  it("bounds multiple idempotent stop markers by retained deliveries", async () => {
+    const { path, journal } = await journalFixture({ maxEntries: 3 });
+    await journal.recordDelivery({ ...delivery("delivery-a"), sessionId: "session-a" });
+    await journal.recordDelivery({ ...delivery("delivery-b"), sessionId: "session-b" });
+
+    await journal.markSessionStopped("session-a", "2026-08-12T12:00:01.000Z");
+    await journal.markSessionStopped("session-a", "2026-08-12T12:00:02.000Z");
+    await journal.markSessionStopped("session-b", "2026-08-12T12:00:03.000Z");
+
+    const reloaded = await RelayJournal.open(path, { maxEntries: 3 });
+    expect(reloaded.snapshot().stoppedSessions).toEqual({
+      "session-a": "2026-08-12T12:00:01.000Z",
+      "session-b": "2026-08-12T12:00:03.000Z",
+    });
+  });
+
   it("compacts only acknowledged terminal deliveries, completed uploads, and stopped sessions", async () => {
     const { journal } = await journalFixture();
     await journal.bindSession(binding());
@@ -413,5 +517,223 @@ describe("RelayJournal", () => {
 
     await journal.compactStoppedSession("linear-session");
     expect(journal.getBinding("linear-session")).toBeUndefined();
+  });
+
+  it("sustains 300 distinct successful stopped sessions without journal growth", async () => {
+    const { journal } = await journalFixture();
+    for (let index = 0; index < 300; index += 1) {
+      const sessionId = `linear-session-${index}`;
+      const deliveryId = uuid(10_000 + index);
+      await journal.bindSession(binding(sessionId));
+      await journal.recordDelivery({
+        ...delivery(deliveryId),
+        sessionId,
+        status: "completed",
+      });
+      await journal.addReplay({
+        key: `status-${deliveryId}`,
+        kind: "delivery_status",
+        frame: terminalStatus(20_000 + index, deliveryId, sessionId),
+      });
+      await journal.markSessionStopped(sessionId, "2026-08-12T12:00:01.000Z");
+      await journal.acknowledgeAndCompactDeliveryStatus(
+        terminalAcknowledgement(30_000 + index, deliveryId, sessionId),
+      );
+    }
+
+    expect(journal.snapshot()).toMatchObject({
+      bindings: {},
+      deliveries: {},
+      replay: [],
+      rpcInvocations: {},
+      uploads: {},
+    });
+  }, 30_000);
+
+  it("preserves one prompted-session binding through deliveries until stop", async () => {
+    const { journal } = await journalFixture();
+    await journal.bindSession(binding());
+
+    for (let index = 0; index < 2; index += 1) {
+      const deliveryId = uuid(40_000 + index);
+      await journal.recordDelivery({
+        ...delivery(deliveryId),
+        action: index === 0 ? "created" : "prompted",
+        sequence: index + 1,
+        status: "completed",
+      });
+      await journal.addReplay({
+        key: `status-${deliveryId}`,
+        kind: "delivery_status",
+        frame: terminalStatus(50_000 + index, deliveryId, "linear-session"),
+      });
+      await journal.acknowledgeAndCompactDeliveryStatus(
+        terminalAcknowledgement(60_000 + index, deliveryId, "linear-session"),
+      );
+      expect(journal.getBinding("linear-session")).toBeDefined();
+    }
+
+    expect(journal.snapshot().deliveries).toEqual({});
+    await journal.markSessionStopped("linear-session", "2026-08-12T12:00:01.000Z");
+    expect(journal.getBinding("linear-session")).toBeUndefined();
+  });
+
+  it("compacts a completed delivery-owned upload only after terminal acknowledgement", async () => {
+    const { journal } = await journalFixture();
+    await journal.bindSession(binding());
+
+    const deliveryId = uuid(70_000);
+    const uploadId = "upload-1";
+    await journal.recordDelivery({ ...delivery(deliveryId), status: "completed" });
+    await journal.recordUpload({
+      uploadId,
+      ownerId: "openclaw-session",
+      deliveryId,
+      sessionId: "linear-session",
+      fileRef: "media://inbound/opaque",
+      status: "completed",
+      assetUrl: "https://uploads.linear.app/asset",
+      recordedAt: "2026-08-12T12:00:00.000Z",
+    });
+    expect(journal.getUpload(uploadId)).toBeDefined();
+    await journal.addReplay({
+      key: `status-${deliveryId}`,
+      kind: "delivery_status",
+      frame: terminalStatus(80_000, deliveryId, "linear-session"),
+    });
+    expect(journal.getUpload(uploadId)).toBeDefined();
+    await journal.acknowledgeAndCompactDeliveryStatus(
+      terminalAcknowledgement(90_000, deliveryId, "linear-session"),
+    );
+    expect(journal.getUpload(uploadId)).toBeUndefined();
+
+    expect(journal.snapshot().uploads).toEqual({});
+  });
+
+  it("persists stop before acknowledgement and finishes safe cleanup after reload", async () => {
+    const { path, journal } = await journalFixture();
+    const deliveryId = uuid(100_000);
+    await journal.bindSession(binding());
+    await journal.recordDelivery({ ...delivery(deliveryId), status: "completed" });
+    await journal.recordUpload({
+      uploadId: "completed-upload",
+      ownerId: "openclaw-session",
+      deliveryId,
+      sessionId: "linear-session",
+      fileRef: "media://inbound/completed",
+      status: "completed",
+      assetUrl: "https://uploads.linear.app/asset/completed",
+      recordedAt: "2026-08-12T12:00:00.000Z",
+    });
+    await journal.recordUpload({
+      uploadId: "ambiguous-upload",
+      ownerId: "openclaw-session",
+      deliveryId,
+      sessionId: "linear-session",
+      fileRef: "media://inbound/ambiguous",
+      status: "ambiguous",
+      recordedAt: "2026-08-12T12:00:00.000Z",
+    });
+    const request = { ...frame(100_001, "rpc.request"), sessionId: "linear-session" } satisfies RpcFrame;
+    await journal.recordRpcInvocation("session-rpc", fingerprint("d"), request, deliveryId);
+    await journal.addReplay({
+      key: `status-${deliveryId}`,
+      kind: "delivery_status",
+      frame: terminalStatus(100_002, deliveryId, "linear-session"),
+    });
+
+    await journal.markSessionStopped("linear-session", "2026-08-12T12:00:01.000Z");
+    const reloaded = await RelayJournal.open(path);
+    expect(reloaded.snapshot().stoppedSessions["linear-session"]).toBe("2026-08-12T12:00:01.000Z");
+    expect(reloaded.getRpcInvocation("session-rpc")).toBeUndefined();
+    expect(reloaded.getUpload("completed-upload")).toBeDefined();
+
+    await reloaded.acknowledgeAndCompactDeliveryStatus(
+      terminalAcknowledgement(100_003, deliveryId, "linear-session"),
+    );
+    expect(reloaded.getBinding("linear-session")).toBeUndefined();
+    expect(reloaded.getUpload("completed-upload")).toBeUndefined();
+    expect(reloaded.getUpload("ambiguous-upload")?.status).toBe("ambiguous");
+  });
+
+  it("keeps an immediate stop durable while a created delivery is waiting to bind", async () => {
+    const { path, journal } = await journalFixture();
+    const deliveryId = uuid(100_010);
+    await journal.recordDelivery(delivery(deliveryId));
+
+    await journal.markSessionStopped("linear-session", "2026-08-12T12:00:01.000Z");
+    await journal.bindSession(binding());
+
+    const reloaded = await RelayJournal.open(path);
+    expect(reloaded.snapshot().stoppedSessions).toEqual({
+      "linear-session": "2026-08-12T12:00:01.000Z",
+    });
+    expect(reloaded.getBinding("linear-session")).toBeDefined();
+  });
+
+  it("accepts the Worker's canceled acknowledgement after a stopped-session crash", async () => {
+    const { path, journal } = await journalFixture();
+    const deliveryId = uuid(100_020);
+    await journal.recordDelivery({ ...delivery(deliveryId), status: "started" });
+    await journal.bindSession(binding());
+    await journal.markSessionStopped("linear-session", "2026-08-12T12:00:01.000Z");
+
+    const reloaded = await RelayJournal.open(path);
+    await expect(reloaded.acknowledgeAndCompactDeliveryStatus(
+      acknowledgementFrame(100_021, deliveryId, "canceled"),
+    )).resolves.toBeUndefined();
+    expect(reloaded.getDelivery(deliveryId)).toBeUndefined();
+    expect(reloaded.getBinding("linear-session")).toBeUndefined();
+    expect(reloaded.snapshot().stoppedSessions).toEqual({});
+  });
+
+  it("still rejects a canceled acknowledgement without a stopped-session marker", async () => {
+    const { journal } = await journalFixture();
+    const deliveryId = uuid(100_030);
+    await journal.recordDelivery({ ...delivery(deliveryId), status: "started" });
+
+    await expect(journal.acknowledgeAndCompactDeliveryStatus(
+      acknowledgementFrame(100_031, deliveryId, "canceled"),
+    )).rejects.toBeInstanceOf(JournalError);
+    expect(journal.getDelivery(deliveryId)?.status).toBe("started");
+  });
+
+  it("retains unresolved activity, RPC, pending, and ambiguous work when capacity fails closed", async () => {
+    const { journal } = await journalFixture({ maxEntries: 8 });
+    await journal.bindSession(binding());
+    await journal.recordDelivery(delivery());
+    await journal.addReplay({ key: "activity-unresolved", kind: "activity", deliveryId: "delivery-1", frame: frame(110_000) });
+    const request = { ...frame(110_001, "rpc.request"), sessionId: "linear-session" } satisfies RpcFrame;
+    await journal.recordRpcInvocation("unresolved-rpc", fingerprint("e"), request, "delivery-1");
+    await journal.recordUpload({
+      uploadId: "pending-upload",
+      ownerId: "openclaw-session",
+      deliveryId: "delivery-1",
+      sessionId: "linear-session",
+      fileRef: "media://inbound/pending",
+      status: "pending",
+      recordedAt: "2026-08-12T12:00:00.000Z",
+    });
+    await journal.recordUpload({
+      uploadId: "ambiguous-upload",
+      ownerId: "openclaw-session",
+      deliveryId: "delivery-1",
+      sessionId: "linear-session",
+      fileRef: "media://inbound/ambiguous",
+      status: "ambiguous",
+      recordedAt: "2026-08-12T12:00:00.000Z",
+    });
+
+    await expect(journal.recordUpload({
+      uploadId: "overflow",
+      ownerId: "generic-context",
+      fileRef: "media://inbound/overflow",
+      status: "pending",
+      recordedAt: "2026-08-12T12:00:00.000Z",
+    })).rejects.toBeInstanceOf(JournalCapacityError);
+    expect(journal.getReplayEntries().map((entry) => entry.kind)).toEqual(["activity", "rpc"]);
+    expect(journal.getRpcInvocation("unresolved-rpc")).toBeDefined();
+    expect(journal.getUpload("pending-upload")?.status).toBe("pending");
+    expect(journal.getUpload("ambiguous-upload")?.status).toBe("ambiguous");
   });
 });

@@ -251,15 +251,6 @@ export function createIntegrationRegistration(
           async onTeamAccessRemoved(teamId): Promise<void> {
             await executor?.handleTeamAccessRemoved(teamId);
           },
-          async onDeliveryAcknowledged(frame): Promise<void> {
-            const status = frame.payload.status;
-            if (status === "completed" || status === "failed" || status === "canceled") {
-              const delivery = journal.getDelivery(frame.payload.deliveryId);
-              if (delivery?.terminalAcknowledged === true) {
-                await journal.compactAcknowledgedDelivery(frame.payload.deliveryId);
-              }
-            }
-          },
           async onInstallationRevoked(): Promise<void> {
             await rpc?.rejectTerminal("revoked");
           },

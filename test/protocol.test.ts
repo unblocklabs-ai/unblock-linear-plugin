@@ -49,7 +49,7 @@ describe("relay protocol v1", () => {
     }
   });
 
-  it("retains legacy RPC compatibility and rejects invalid parity fixtures", async () => {
+  it("rejects invalid parity fixtures", async () => {
     const invalid = await fixture("invalid-frames.json");
     expect(Array.isArray(invalid)).toBe(true);
 

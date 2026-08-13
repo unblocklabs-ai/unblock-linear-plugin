@@ -23,6 +23,20 @@ export const MAX_PERSISTED_RPC_BYTES = 60 * 1024;
 
 export type JournalLifecycleFence = "normal" | "revoked" | "device_replaced";
 
+export type FencedEnrollmentIdentity = {
+  agentId: string;
+  deviceId: string;
+  enrollmentGeneration: number;
+};
+
+export type JournalLifecycle =
+  | { fence: "normal" | "revoked" }
+  | {
+      fence: "device_replaced";
+      generation: number;
+      enrollment: FencedEnrollmentIdentity;
+    };
+
 export type JsonPrimitive = string | number | boolean | null;
 export type JsonValue = JsonPrimitive | JsonObject | JsonValue[];
 export type JsonObject = { [key: string]: JsonValue };
@@ -133,6 +147,8 @@ export type UploadWorkflowStatus = "pending" | "uploading" | "completed" | "fail
 export type UploadWorkflow = {
   uploadId: string;
   ownerId: string;
+  deliveryId?: string;
+  sessionId?: string;
   fileRef: string;
   filename?: string;
   contentType?: string;
@@ -147,11 +163,9 @@ export type UploadWorkflow = {
 
 type JournalState = {
   version: 1;
-  lifecycle: {
-    fence: JournalLifecycleFence;
-    generation?: number;
-  };
+  lifecycle: JournalLifecycle;
   nextSequence: number;
+  stoppedSessions: Record<string, string>;
   bindings: Record<string, SessionBinding>;
   deliveries: Record<string, DeliveryRecord>;
   replay: ReplayEntry[];
@@ -189,6 +203,7 @@ function emptyState(): JournalState {
     version: RELAY_JOURNAL_VERSION,
     lifecycle: { fence: "normal" },
     nextSequence: 1,
+    stoppedSessions: {},
     bindings: {},
     deliveries: {},
     replay: [],
@@ -227,6 +242,12 @@ function isIsoDate(value: unknown): value is string {
 
 function isPositiveInteger(value: unknown): value is number {
   return typeof value === "number" && Number.isSafeInteger(value) && value > 0;
+}
+
+function validateEnrollmentIdentity(value: unknown): value is FencedEnrollmentIdentity {
+  return isRecord(value) && hasOnlyKeys(value, ["agentId", "deviceId", "enrollmentGeneration"]) &&
+    isString(value.agentId, 128) && isString(value.deviceId, 128) &&
+    isPositiveInteger(value.enrollmentGeneration);
 }
 
 function isTerminalDeliveryStatus(status: unknown): status is Extract<
@@ -388,6 +409,8 @@ function validateRpcInvocation(value: unknown): value is RpcInvocationRecord {
 function validateUpload(value: unknown): value is UploadWorkflow {
   if (!isRecord(value)) return false;
   return isString(value.uploadId) && isString(value.ownerId) && isString(value.fileRef) &&
+    isOptionalString(value.deliveryId) && isOptionalString(value.sessionId, 128) &&
+    (value.deliveryId === undefined) === (value.sessionId === undefined) &&
     managedMediaId(value.fileRef) !== undefined && isOptionalString(value.filename) && isOptionalString(value.contentType) &&
     (value.status === "pending" || value.status === "uploading" || value.status === "completed" || value.status === "failed" || value.status === "ambiguous") &&
     isOptionalString(value.graphqlCorrelationId) && isOptionalString(value.idempotencyKey) && isOptionalString(value.destination, 8_192) &&
@@ -397,15 +420,24 @@ function validateUpload(value: unknown): value is UploadWorkflow {
 
 function validateState(value: unknown): value is JournalState {
   if (!isRecord(value) || value.version !== 1 || !isRecord(value.lifecycle) ||
+    !hasOnlyKeys(value.lifecycle, ["fence", "generation", "enrollment"]) ||
     (value.lifecycle.fence !== "normal" && value.lifecycle.fence !== "revoked" && value.lifecycle.fence !== "device_replaced") ||
-    (value.lifecycle.generation !== undefined && !isPositiveInteger(value.lifecycle.generation)) ||
-    (value.lifecycle.fence === "device_replaced" && !isPositiveInteger(value.lifecycle.generation)) || !isPositiveInteger(value.nextSequence) ||
-    !isRecord(value.bindings) || !isRecord(value.deliveries) || !Array.isArray(value.replay) ||
+    (value.lifecycle.fence === "device_replaced"
+      ? (!isPositiveInteger(value.lifecycle.generation) || !validateEnrollmentIdentity(value.lifecycle.enrollment))
+      : (value.lifecycle.generation !== undefined || value.lifecycle.enrollment !== undefined)) ||
+    !isPositiveInteger(value.nextSequence) ||
+    !isRecord(value.stoppedSessions) || !isRecord(value.bindings) || !isRecord(value.deliveries) || !Array.isArray(value.replay) ||
     !isRecord(value.rpcInvocations) || !isRecord(value.uploads)) return false;
   const replay = value.replay;
-  if (!replay.every((entry): entry is ReplayEntry => validateReplay(entry))) return false;
-  return Object.entries(value.bindings).every(([key, entry]) => isRecord(entry) && key === entry.linearSessionId && validateBinding(entry)) &&
-    Object.entries(value.deliveries).every(([key, entry]) => isRecord(entry) && key === entry.deliveryId && validateDelivery(entry)) &&
+  const stoppedSessions = value.stoppedSessions;
+  const deliveryEntries = Object.entries(value.deliveries);
+  if (!replay.every((entry): entry is ReplayEntry => validateReplay(entry)) ||
+    !deliveryEntries.every((entry): entry is [string, DeliveryRecord] =>
+      isRecord(entry[1]) && entry[0] === entry[1].deliveryId && validateDelivery(entry[1]))) return false;
+  return Object.entries(stoppedSessions).every(([sessionId, stoppedAt]) =>
+    isString(sessionId, 128) && isIsoDate(stoppedAt) &&
+      deliveryEntries.some(([, delivery]) => delivery.sessionId === sessionId)) &&
+    Object.entries(value.bindings).every(([key, entry]) => isRecord(entry) && key === entry.linearSessionId && validateBinding(entry)) &&
     replay.every((entry, index, all) => all.findIndex((candidate) => candidate.key === entry.key) === index) &&
     replay.every((entry, index, all) => index === 0 || entry.sequence > all[index - 1].sequence) &&
     (replay.length === 0 || value.nextSequence > replay[replay.length - 1].sequence) &&
@@ -424,12 +456,82 @@ function encodedSize(value: JournalState): number {
 }
 
 function entryCount(state: JournalState): number {
-  return 1 + Object.keys(state.bindings).length + Object.keys(state.deliveries).length +
+  return 1 + Object.keys(state.stoppedSessions).length + Object.keys(state.bindings).length + Object.keys(state.deliveries).length +
     state.replay.length + Object.keys(state.rpcInvocations).length + Object.keys(state.uploads).length;
 }
 
 function errorFromRead(): JournalError {
   return new JournalError("Journal state is corrupt");
+}
+
+function acknowledgeDeliveryStatus(
+  state: JournalState,
+  frame: DeliveryAcknowledgementFrame,
+): DeliveryRecord | undefined {
+  const delivery = state.deliveries[frame.payload.deliveryId];
+  if (delivery === undefined) return undefined;
+  if (delivery.sessionId !== frame.sessionId || delivery.idempotencyKey !== frame.idempotencyKey) {
+    throw new JournalError("Journal state failed validation");
+  }
+  const replayIndex = state.replay.findIndex((entry) =>
+    entry.kind === "delivery_status" &&
+    entry.frame.type === "delivery.status" &&
+    entry.frame.payload.deliveryId === frame.payload.deliveryId &&
+    entry.frame.payload.status === frame.payload.status &&
+    entry.frame.sessionId === frame.sessionId &&
+    entry.frame.idempotencyKey === frame.idempotencyKey);
+  if (replayIndex === -1) {
+    if (frame.payload.status === "canceled" && state.stoppedSessions[delivery.sessionId] !== undefined) {
+      delivery.status = "canceled";
+      delivery.terminalAcknowledged = true;
+      return delivery;
+    }
+    const alreadyAcknowledged = delivery.status === frame.payload.status &&
+      (!isTerminalDeliveryStatus(frame.payload.status) || delivery.terminalAcknowledged);
+    if (!alreadyAcknowledged) throw new JournalError("Journal state failed validation");
+    return delivery;
+  }
+
+  state.replay.splice(replayIndex, 1);
+  if (isTerminalDeliveryStatus(frame.payload.status)) {
+    delivery.status = frame.payload.status;
+    delivery.terminalAcknowledged = true;
+  } else if (!isTerminalDeliveryStatus(delivery.status)) {
+    delivery.status = frame.payload.status;
+  }
+  return delivery;
+}
+
+function compactAcknowledgedDelivery(state: JournalState, delivery: DeliveryRecord): void {
+  state.replay = state.replay.filter((entry) =>
+    entry.deliveryId !== delivery.deliveryId || entry.kind === "rpc");
+  delete state.deliveries[delivery.deliveryId];
+  for (const [uploadId, upload] of Object.entries(state.uploads)) {
+    if (upload.deliveryId === delivery.deliveryId && upload.status === "completed") {
+      delete state.uploads[uploadId];
+    }
+  }
+  compactStoppedSessionIfSafe(state, delivery.sessionId);
+}
+
+function compactStoppedSessionIfSafe(state: JournalState, sessionId: string): void {
+  if (state.stoppedSessions[sessionId] === undefined || Object.values(state.deliveries).some(
+    (delivery) => delivery.sessionId === sessionId,
+  )) return;
+  compactStoppedSession(state, sessionId);
+}
+
+function compactStoppedSession(state: JournalState, sessionId: string): void {
+  delete state.stoppedSessions[sessionId];
+  delete state.bindings[sessionId];
+  state.replay = state.replay.filter((entry) => entry.sessionId !== sessionId || entry.kind === "rpc");
+}
+
+function removeSessionRpcs(state: JournalState, sessionId: string): void {
+  state.replay = state.replay.filter((entry) => entry.kind !== "rpc" || entry.sessionId !== sessionId);
+  for (const [invocationId, invocation] of Object.entries(state.rpcInvocations)) {
+    if (invocation.request.sessionId === sessionId) delete state.rpcInvocations[invocationId];
+  }
 }
 
 export class RelayJournal {
@@ -459,10 +561,10 @@ export class RelayJournal {
   private static async read(path: string): Promise<JournalState> {
     const readOne = async (source: string): Promise<JournalState | undefined> => {
       try {
-        const value: unknown = JSON.parse(await readFile(source, "utf8"));
-        if (!validateState(value)) throw errorFromRead();
+        const parsed: unknown = JSON.parse(await readFile(source, "utf8"));
+        if (!validateState(parsed)) throw errorFromRead();
         await chmod(source, 0o600);
-        return value;
+        return parsed;
       } catch (error) {
         if (isNodeNotFound(error)) return undefined;
         throw errorFromRead();
@@ -481,7 +583,10 @@ export class RelayJournal {
   }
 
   private assertWithinBounds(state: JournalState): void {
-    if (entryCount(state) > this.maxEntries || encodedSize(state) > this.maxBytes) throw new JournalCapacityError();
+    const capacityState = { ...state, stoppedSessions: {} };
+    if (entryCount(capacityState) > this.maxEntries || encodedSize(capacityState) > this.maxBytes) {
+      throw new JournalCapacityError();
+    }
   }
 
   private enqueue<T>(operation: () => Promise<T>): Promise<T> {
@@ -555,9 +660,39 @@ export class RelayJournal {
     return clone(this.state.uploads[uploadId]);
   }
 
-  setLifecycle(fence: JournalLifecycleFence, generation?: number): Promise<void> {
+  setLifecycle(...input:
+    | [fence: Exclude<JournalLifecycleFence, "device_replaced">]
+    | [fence: "device_replaced", generation: number, enrollment: FencedEnrollmentIdentity]
+  ): Promise<void> {
     return this.mutate((state) => {
-      state.lifecycle = { fence, ...(generation === undefined ? {} : { generation }) };
+      state.lifecycle = input[0] === "device_replaced"
+        ? { fence: input[0], generation: input[1], enrollment: input[2] }
+        : { fence: input[0] };
+    });
+  }
+
+  activateReplacement(enrollment: FencedEnrollmentIdentity): Promise<void> {
+    return this.mutate((state) => {
+      const lifecycle = state.lifecycle;
+      if (lifecycle.fence !== "device_replaced" || enrollment.enrollmentGeneration < lifecycle.generation ||
+        lifecycle.enrollment.agentId !== enrollment.agentId ||
+        isDeepStrictEqual(lifecycle.enrollment, enrollment)) {
+        throw new JournalError("Journal state failed validation");
+      }
+
+      const rebindFrame = <T extends RelayFrame | RpcResultFrame>(frame: T): T => {
+        if (frame.agentId !== enrollment.agentId) {
+          throw new JournalError("Journal state failed validation");
+        }
+        return { ...frame, deviceId: enrollment.deviceId };
+      };
+
+      for (const entry of state.replay) entry.frame = rebindFrame(entry.frame);
+      for (const invocation of Object.values(state.rpcInvocations)) {
+        invocation.request = rebindFrame(invocation.request);
+        if (invocation.result !== undefined) invocation.result = rebindFrame(invocation.result);
+      }
+      state.lifecycle = { fence: "normal" };
     });
   }
 
@@ -728,44 +863,15 @@ export class RelayJournal {
 
   acknowledgeDeliveryStatus(frame: DeliveryAcknowledgementFrame): Promise<void> {
     return this.mutate((state) => {
-      const encoded = JSON.stringify(frame);
-      let acknowledgement: InboundRelayFrame;
-      try {
-        acknowledgement = parseInboundRelayFrame(encoded);
-      } catch {
-        throw new JournalError("Journal state failed validation");
-      }
-      if (acknowledgement.type !== "delivery.ack" ||
-        !isDeepStrictEqual(acknowledgement, frame)) {
-        throw new JournalError("Journal state failed validation");
-      }
+      acknowledgeDeliveryStatus(state, frame);
+    });
+  }
 
-      const delivery = state.deliveries[frame.payload.deliveryId];
-      if (delivery === undefined) return;
-      if (delivery.sessionId !== frame.sessionId ||
-        delivery.idempotencyKey !== frame.idempotencyKey) {
-        throw new JournalError("Journal state failed validation");
-      }
-      const replayIndex = state.replay.findIndex((entry) =>
-        entry.kind === "delivery_status" &&
-        entry.frame.type === "delivery.status" &&
-        entry.frame.payload.deliveryId === frame.payload.deliveryId &&
-        entry.frame.payload.status === frame.payload.status &&
-        entry.frame.sessionId === frame.sessionId &&
-        entry.frame.idempotencyKey === frame.idempotencyKey);
-      if (replayIndex === -1) {
-        const alreadyAcknowledged = delivery.status === frame.payload.status &&
-          (!isTerminalDeliveryStatus(frame.payload.status) || delivery.terminalAcknowledged);
-        if (!alreadyAcknowledged) throw new JournalError("Journal state failed validation");
-        return;
-      }
-
-      state.replay.splice(replayIndex, 1);
-      if (isTerminalDeliveryStatus(frame.payload.status)) {
-        delivery.status = frame.payload.status;
-        delivery.terminalAcknowledged = true;
-      } else if (!isTerminalDeliveryStatus(delivery.status)) {
-        delivery.status = frame.payload.status;
+  acknowledgeAndCompactDeliveryStatus(frame: DeliveryAcknowledgementFrame): Promise<void> {
+    return this.mutate((state) => {
+      const delivery = acknowledgeDeliveryStatus(state, frame);
+      if (delivery !== undefined && isTerminalDeliveryStatus(frame.payload.status)) {
+        compactAcknowledgedDelivery(state, delivery);
       }
     });
   }
@@ -810,9 +916,7 @@ export class RelayJournal {
         !delivery.terminalAcknowledged) {
         throw new JournalError("Journal state failed validation");
       }
-      state.replay = state.replay.filter((entry) =>
-        entry.deliveryId !== deliveryId || entry.kind === "rpc");
-      delete state.deliveries[deliveryId];
+      compactAcknowledgedDelivery(state, delivery);
     });
   }
 
@@ -836,21 +940,29 @@ export class RelayJournal {
         !isTerminalDeliveryStatus(delivery.status) || !delivery.terminalAcknowledged)) {
         throw new JournalError("Journal state failed validation");
       }
-      delete state.bindings[sessionId];
-      for (const delivery of deliveries) delete state.deliveries[delivery.deliveryId];
-      state.replay = state.replay.filter((entry) =>
-        entry.sessionId !== sessionId || entry.kind === "rpc");
+      for (const delivery of deliveries) compactAcknowledgedDelivery(state, delivery);
+      compactStoppedSession(state, sessionId);
+    });
+  }
+
+  markSessionStopped(sessionId: string, stoppedAt: string): Promise<void> {
+    return this.mutate((state) => {
+      if (!isString(sessionId, 128) || !isIsoDate(stoppedAt)) {
+        throw new JournalError("Journal state failed validation");
+      }
+      removeSessionRpcs(state, sessionId);
+      if (Object.values(state.deliveries).some((delivery) => delivery.sessionId === sessionId)) {
+        state.stoppedSessions[sessionId] ??= stoppedAt;
+      } else {
+        compactStoppedSession(state, sessionId);
+      }
     });
   }
 
   removeCanceledSessionRpcs(sessionId: string): Promise<void> {
     return this.mutate((state) => {
       if (!isString(sessionId, 128)) throw new JournalError("Journal state failed validation");
-      state.replay = state.replay.filter((entry) =>
-        entry.kind !== "rpc" || entry.sessionId !== sessionId);
-      for (const [invocationId, invocation] of Object.entries(state.rpcInvocations)) {
-        if (invocation.request.sessionId === sessionId) delete state.rpcInvocations[invocationId];
-      }
+      removeSessionRpcs(state, sessionId);
     });
   }
 

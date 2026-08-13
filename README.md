@@ -7,7 +7,7 @@ media uploads.
 
 ## Requirements
 
-- OpenClaw **2026.7.2 or newer**
+- OpenClaw **2026.7.2-beta.7 or newer**
 - Node.js 22 or newer
 - An enrolled P-256 device and its private JWK stored through an OpenClaw
   `SecretRef`
@@ -53,26 +53,22 @@ development path; the package install is the release path.
 ## Configure an enrolled device
 
 Add the channel configuration to the OpenClaw configuration under
-`plugins.entries.unblock-linear.config`:
+`channels.unblock-linear`:
 
 ```json
 {
-  "plugins": {
-    "entries": {
-      "unblock-linear": {
-        "enabled": true,
-        "config": {
-          "accountId": "default",
-          "origin": "https://linear.unblocklabs.ai",
-          "agentId": "bill-01",
-          "deviceId": "bill-device-prod-3",
-          "enrollmentGeneration": 1,
-          "devicePrivateKey": {
-            "source": "env",
-            "provider": "default",
-            "id": "UNBLOCK_LINEAR_DEVICE_PRIVATE_JWK"
-          }
-        }
+  "channels": {
+    "unblock-linear": {
+      "enabled": true,
+      "accountId": "default",
+      "origin": "https://linear.unblocklabs.ai",
+      "agentId": "bill-01",
+      "deviceId": "bill-device-prod-3",
+      "enrollmentGeneration": 1,
+      "devicePrivateKey": {
+        "source": "env",
+        "provider": "default",
+        "id": "UNBLOCK_LINEAR_DEVICE_PRIVATE_JWK"
       }
     }
   }

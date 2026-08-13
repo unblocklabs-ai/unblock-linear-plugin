@@ -59,6 +59,8 @@ export type ManagedUploadDependencies = {
 export type ManagedUploadInput = {
   toolCallId: string;
   ownerId: string;
+  deliveryId?: string;
+  sessionId?: string;
   fileRef: string;
   filename?: string;
   contentType?: string;
@@ -99,6 +101,11 @@ export async function executeManagedUpload(
   if (managedMediaId(input.fileRef) === undefined) throw invalidSource();
   const uploadId = stableUploadId(input.toolCallId);
   const prior = dependencies.workflows.getUpload(uploadId);
+  if (prior !== undefined && (prior.ownerId !== input.ownerId ||
+    prior.deliveryId !== input.deliveryId || prior.sessionId !== input.sessionId ||
+    prior.fileRef !== input.fileRef)) {
+    throw invalidMedia();
+  }
   if (prior?.status === "completed" && prior.assetUrl !== undefined) {
     return { assetUrl: prior.assetUrl };
   }
@@ -122,14 +129,15 @@ export async function executeManagedUpload(
     await dependencies.workflows.recordUpload({
       uploadId,
       ownerId: input.ownerId,
+      ...(input.deliveryId === undefined ? {} : { deliveryId: input.deliveryId }),
+      ...(input.sessionId === undefined ? {} : { sessionId: input.sessionId }),
       fileRef: input.fileRef,
       filename,
       contentType,
       status: "pending",
       recordedAt,
     });
-  } else if (prior.ownerId !== input.ownerId || prior.fileRef !== input.fileRef ||
-    prior.filename !== filename || prior.contentType !== contentType) {
+  } else if (prior.filename !== filename || prior.contentType !== contentType) {
     throw invalidMedia();
   }
 

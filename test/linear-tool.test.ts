@@ -335,7 +335,16 @@ describe("linear tool", () => {
           },
         },
       },
-    }, hostContext());
+    }, hostContext({
+      toolBindings: {
+        [LINEAR_RUN_BINDING_KEY]: {
+          linearSessionId: "linear-session",
+          contextId: "host-session-uuid",
+          deliveryId: "delivery-1",
+          teamId: "linear-team",
+        },
+      },
+    }));
 
     await expect(tool.execute("upload-tool-call", {
       action: "upload",
@@ -352,6 +361,12 @@ describe("linear tool", () => {
       },
     });
     expect(request.payload.params.document).toContain("fileUpload");
+    expect(workflow).toMatchObject({
+      ownerId: "host-session-uuid",
+      deliveryId: "delivery-1",
+      sessionId: "linear-session",
+      status: "completed",
+    });
   });
 
   it.each([

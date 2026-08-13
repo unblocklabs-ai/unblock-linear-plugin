@@ -1,11 +1,11 @@
-import { mkdtemp, writeFile } from "node:fs/promises";
+import { mkdir, mkdtemp, rmdir, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 
 import { describe, expect, it, vi } from "vitest";
 
 import { type DeviceAuthUpgradeInput } from "../src/relay/device-auth.js";
-import { RelayJournal } from "../src/relay/journal.js";
+import { RelayJournal, type RelayJournalOptions } from "../src/relay/journal.js";
 import { parseInboundRelayFrame, parseOutboundRelayFrame } from "../src/relay/protocol.js";
 import { acquireRelayWriterLease, RelayLeaseError } from "../src/relay/lease.js";
 import { RelayService, type RelaySocket, type RelayTimer } from "../src/relay/service.js";
@@ -103,11 +103,11 @@ class FakeTimer implements RelayTimer {
   }
 }
 
-async function createJournal(): Promise<{ journal: RelayJournal; journalPath: string; leasePath: string }> {
+async function createJournal(options: RelayJournalOptions = {}): Promise<{ journal: RelayJournal; journalPath: string; leasePath: string }> {
   const directory = await mkdtemp(join(tmpdir(), "unblock-linear-relay-service-"));
   const journalPath = join(directory, "journal.json");
   return {
-    journal: await RelayJournal.open(journalPath),
+    journal: await RelayJournal.open(journalPath, options),
     journalPath,
     leasePath: join(directory, "writer.lock"),
   };
@@ -251,7 +251,7 @@ describe("RelayService", () => {
       sessionId,
       correlationId: "20000000-0000-4000-8000-000000000004",
       idempotencyKey: "rpc-1",
-      payload: { method: "linear.issue.read", params: { issueId: "issue-1" } },
+      payload: { method: "linear.graphql", params: { contextId: "session:session-1", document: "query { viewer { id } }", variables: {} } },
     });
     if (status.type !== "delivery.status" || rpc.type !== "rpc.request") throw new Error("Unexpected test frame type");
     await journal.addReplay({ key: "delivery-status", kind: "delivery_status", frame: status });
@@ -317,6 +317,262 @@ describe("RelayService", () => {
     await waitFor(() => expect(events).toEqual(["session", "team", "ack", "delivery", "global"]));
     expect(journal.getReplayEntries().map((entry) => entry.key)).toEqual([]);
     expect(service.getState()).toBe("revoked");
+    await service.stop();
+  });
+
+  it("persists an immediate session stop while the created delivery is paused before binding", async () => {
+    const { journal, leasePath } = await createJournal();
+    const socket = new FakeSocket();
+    const deliveryId = "20000000-0000-4000-8000-000000000011";
+    let releaseBinding: (() => void) | undefined;
+    const bindingReleased = new Promise<void>((resolve) => { releaseBinding = resolve; });
+    let deliveryRecorded: (() => void) | undefined;
+    const recorded = new Promise<void>((resolve) => { deliveryRecorded = resolve; });
+    const service = new RelayService({
+      account,
+      journal,
+      leasePath,
+      socketFactory: () => socket as unknown as RelaySocket,
+      callbacks: {
+        onDelivery: async (frame) => {
+          await journal.recordDelivery({
+            deliveryId,
+            sessionId: frame.sessionId,
+            teamId: "team-1",
+            idempotencyKey: deliveryId,
+            action: "created",
+            sequence: 1,
+            prompt: "Work",
+            status: "offered",
+            terminalAcknowledged: false,
+            toolRecovery: { state: "none", reconciliationRequired: false },
+            recordedAt: base.timestamp,
+          });
+          deliveryRecorded?.();
+          await bindingReleased;
+          await journal.bindSession({
+            linearSessionId: frame.sessionId,
+            teamId: "team-1",
+            openclawSessionId: "openclaw-session",
+            sessionTarget: {
+              agentId: "default",
+              sessionId: "openclaw-session",
+              sessionKey: "agent:default:linear:session-1",
+              storePath: "/private/openclaw/sessions.json",
+            },
+            routing: {
+              agentId: "default",
+              channel: "unblock-linear",
+              accountId: "default",
+              sessionKey: "agent:default:linear:session-1",
+              mainSessionKey: "agent:default:main",
+              lastRoutePolicy: "session",
+              matchedBy: "default",
+            },
+            createdAt: base.timestamp,
+          });
+        },
+      },
+    });
+    await service.start({ oneShot: true });
+    socket.open();
+    socket.message(inbound({
+      ...base,
+      id: "20000000-0000-4000-8000-000000000012",
+      type: "delivery",
+      sessionId: "session-1",
+      idempotencyKey: deliveryId,
+      payload: { deliveryId, action: "created", sequence: 1, teamId: "team-1", prompt: "Work" },
+    }));
+    await recorded;
+    socket.message(inbound({
+      ...base,
+      id: "20000000-0000-4000-8000-000000000013",
+      type: "control",
+      sessionId: "session-1",
+      payload: { kind: "session.stop", reason: "Stopped" },
+    }));
+    await waitFor(() => expect(journal.snapshot().stoppedSessions["session-1"]).toBe(base.timestamp));
+    releaseBinding?.();
+    await waitFor(() => expect(journal.snapshot().stoppedSessions["session-1"]).toBe(base.timestamp));
+    await service.stop();
+  });
+
+  it("persists and aborts a session stop when ordinary journal entries are at capacity", async () => {
+    const { journalPath, journal, leasePath } = await createJournal({ maxEntries: 2 });
+    const deliveryId = "20000000-0000-4000-8000-000000000014";
+    await journal.recordDelivery({
+      deliveryId,
+      sessionId: "session-1",
+      teamId: "team-1",
+      idempotencyKey: deliveryId,
+      action: "created",
+      sequence: 1,
+      prompt: "Work",
+      status: "started",
+      terminalAcknowledged: false,
+      toolRecovery: { state: "none", reconciliationRequired: false },
+      recordedAt: base.timestamp,
+    });
+    const onSessionStop = vi.fn();
+    const socket = new FakeSocket();
+    const service = new RelayService({
+      account,
+      journal,
+      leasePath,
+      socketFactory: () => socket as unknown as RelaySocket,
+      callbacks: { onSessionStop },
+    });
+    await service.start({ oneShot: true });
+    socket.open();
+
+    socket.message(inbound({
+      ...base,
+      id: "20000000-0000-4000-8000-000000000015",
+      type: "control",
+      sessionId: "session-1",
+      payload: { kind: "session.stop", reason: "Stopped" },
+    }));
+    await waitFor(() => {
+      expect(onSessionStop).toHaveBeenCalledWith("session-1", "Stopped");
+      expect(journal.snapshot().stoppedSessions["session-1"]).toBe(base.timestamp);
+    });
+    await service.stop();
+
+    const reloaded = await RelayJournal.open(journalPath, { maxEntries: 2 });
+    expect(reloaded.snapshot().stoppedSessions["session-1"]).toBe(base.timestamp);
+    const acknowledgement = parseInboundRelayFrame(JSON.stringify({
+      ...base,
+      id: "20000000-0000-4000-8000-000000000016",
+      type: "delivery.ack",
+      sessionId: "session-1",
+      idempotencyKey: deliveryId,
+      payload: { deliveryId, status: "canceled" },
+    }));
+    if (acknowledgement.type !== "delivery.ack") throw new Error("Unexpected test frame type");
+    await reloaded.acknowledgeAndCompactDeliveryStatus(acknowledgement);
+    expect(reloaded.getDelivery(deliveryId)).toBeUndefined();
+    expect(reloaded.snapshot().stoppedSessions).toEqual({});
+  });
+
+  it("aborts and fails closed when a session stop cannot be persisted", async () => {
+    const { journalPath, journal, leasePath } = await createJournal();
+    const deliveryId = "20000000-0000-4000-8000-000000000017";
+    await journal.recordDelivery({
+      deliveryId,
+      sessionId: "session-1",
+      teamId: "team-1",
+      idempotencyKey: deliveryId,
+      action: "created",
+      sequence: 1,
+      prompt: "Work",
+      status: "started",
+      terminalAcknowledged: false,
+      toolRecovery: { state: "none", reconciliationRequired: false },
+      recordedAt: base.timestamp,
+    });
+    const onSessionStop = vi.fn();
+    const socket = new FakeSocket();
+    const service = new RelayService({
+      account,
+      journal,
+      leasePath,
+      socketFactory: () => socket as unknown as RelaySocket,
+      callbacks: { onSessionStop },
+    });
+    await service.start({ oneShot: true });
+    socket.open();
+    const blockedTemporaryPath = `${journalPath}.tmp`;
+    await mkdir(blockedTemporaryPath);
+
+    socket.message(inbound({
+      ...base,
+      id: "20000000-0000-4000-8000-000000000018",
+      type: "control",
+      sessionId: "session-1",
+      payload: { kind: "session.stop", reason: "Stopped" },
+    }));
+    await waitFor(() => {
+      expect(onSessionStop).toHaveBeenCalledWith("session-1", "Stopped");
+      expect(socket.closes.at(-1)).toEqual({ code: 1011, reason: "Relay frame processing failed" });
+    });
+    expect(journal.snapshot().stoppedSessions).toEqual({});
+
+    await rmdir(blockedTemporaryPath);
+    await service.stop();
+  });
+
+  it("preserves the persistence error when session stop persistence and cancellation both fail", async () => {
+    const { journal, leasePath } = await createJournal();
+    const persistenceError = new Error("journal unavailable");
+    const cancellationError = new Error("cancellation failed");
+    vi.spyOn(journal, "markSessionStopped").mockRejectedValue(persistenceError);
+    const onSessionStop = vi.fn().mockRejectedValue(cancellationError);
+    const socket = new FakeSocket();
+    const service = new RelayService({
+      account,
+      journal,
+      leasePath,
+      socketFactory: () => socket as unknown as RelaySocket,
+      callbacks: { onSessionStop },
+    });
+    const frame = parseInboundRelayFrame(JSON.stringify({
+      ...base,
+      id: "20000000-0000-4000-8000-000000000019",
+      type: "control",
+      sessionId: "session-1",
+      payload: { kind: "session.stop", reason: "Stopped" },
+    }));
+    if (frame.type !== "control") throw new Error("Unexpected test frame type");
+
+    await expect(service["handleControl"](socket as unknown as RelaySocket, frame)).rejects.toBe(persistenceError);
+    expect(onSessionStop).toHaveBeenCalledWith("session-1", "Stopped");
+  });
+
+  it("accepts Worker control-then-canceled-ack ordering after a crash", async () => {
+    const { journalPath, journal, leasePath } = await createJournal();
+    const deliveryId = "20000000-0000-4000-8000-000000000021";
+    await journal.recordDelivery({
+      deliveryId,
+      sessionId: "session-1",
+      teamId: "team-1",
+      idempotencyKey: deliveryId,
+      action: "created",
+      sequence: 1,
+      prompt: "Work",
+      status: "started",
+      terminalAcknowledged: false,
+      toolRecovery: { state: "none", reconciliationRequired: false },
+      recordedAt: base.timestamp,
+    });
+    const reloaded = await RelayJournal.open(journalPath);
+    const socket = new FakeSocket();
+    const service = new RelayService({
+      account,
+      journal: reloaded,
+      leasePath,
+      socketFactory: () => socket as unknown as RelaySocket,
+    });
+    await service.start({ oneShot: true });
+    socket.open();
+    socket.message(inbound({
+      ...base,
+      id: "20000000-0000-4000-8000-000000000022",
+      type: "control",
+      sessionId: "session-1",
+      payload: { kind: "session.stop", reason: "Stopped" },
+    }));
+    socket.message(inbound({
+      ...base,
+      id: "20000000-0000-4000-8000-000000000023",
+      type: "delivery.ack",
+      sessionId: "session-1",
+      idempotencyKey: deliveryId,
+      payload: { deliveryId, status: "canceled" },
+    }));
+    await waitFor(() => expect(reloaded.getDelivery(deliveryId)).toBeUndefined());
+    expect(reloaded.snapshot().stoppedSessions).toEqual({});
+    expect(socket.closes).toEqual([]);
     await service.stop();
   });
 
@@ -468,11 +724,117 @@ describe("RelayService", () => {
       payload: { kind: "device.replaced", generation: 2 },
     }));
     await waitFor(() => expect(service.getState()).toBe("device_replaced"));
-    expect(journal.getLifecycle()).toEqual({ fence: "device_replaced", generation: 2 });
+    expect(journal.getLifecycle()).toEqual({
+      fence: "device_replaced",
+      generation: 2,
+      enrollment: { agentId: "agent-1", deviceId: "device-1", enrollmentGeneration: 1 },
+    });
     expect(replaced).toEqual([2]);
     expect(terminal).toEqual(["device_replaced"]);
     expect(socket.closes.at(-1)).toMatchObject({ code: 4001 });
     await service.stop();
+  });
+
+  it("fences the old enrollment when the Worker sends the new device identity then immediately closes", async () => {
+    const { journal, leasePath } = await createJournal();
+    const socket = new FakeSocket();
+    const timer = new FakeTimer();
+    const release = vi.fn(async () => undefined);
+    const replaced: number[] = [];
+    const service = new RelayService({
+      account,
+      journal,
+      leasePath,
+      timers: timer,
+      socketFactory: () => socket as unknown as RelaySocket,
+      acquireLease: vi.fn(async () => ({ release })),
+      callbacks: {
+        onDeviceReplaced: (generation) => { replaced.push(generation); },
+      },
+    });
+    await service.start();
+    socket.open();
+
+    socket.message(inbound({
+      ...base,
+      id: "40000000-0000-4000-8000-000000000002",
+      type: "control",
+      deviceId: "device-2",
+      payload: { kind: "device.replaced", generation: 2 },
+    }));
+    socket.close(4001, "Device enrollment rotated");
+
+    await waitFor(() => expect(service.getState()).toBe("device_replaced"));
+    expect(journal.getLifecycle()).toEqual({
+      fence: "device_replaced",
+      generation: 2,
+      enrollment: { agentId: "agent-1", deviceId: "device-1", enrollmentGeneration: 1 },
+    });
+    expect(replaced).toEqual([2]);
+    expect(timer.scheduled).toEqual([]);
+    expect(release).toHaveBeenCalledOnce();
+  });
+
+  it.each([
+    {
+      name: "a replacement generation that is not newer",
+      frame: {
+        ...base,
+        id: "40000000-0000-4000-8000-000000000003",
+        type: "control",
+        deviceId: "device-2",
+        payload: { kind: "device.replaced", generation: 1 },
+      },
+    },
+    {
+      name: "a cross-agent replacement",
+      frame: {
+        ...base,
+        id: "40000000-0000-4000-8000-000000000004",
+        type: "control",
+        agentId: "other-agent",
+        deviceId: "device-2",
+        payload: { kind: "device.replaced", generation: 2 },
+      },
+    },
+    {
+      name: "another control kind stamped with a different device",
+      frame: {
+        ...base,
+        id: "40000000-0000-4000-8000-000000000005",
+        type: "control",
+        deviceId: "device-2",
+        payload: { kind: "installation.revoked" },
+      },
+    },
+    {
+      name: "a non-control frame stamped with a different device",
+      frame: {
+        ...base,
+        id: "40000000-0000-4000-8000-000000000006",
+        type: "rpc.result",
+        deviceId: "device-2",
+        correlationId: "40000000-0000-4000-8000-000000000007",
+        payload: { ok: true, result: {} },
+      },
+    },
+  ])("policy-closes $name without creating a replacement fence", async ({ frame }) => {
+    const { journal, leasePath } = await createJournal();
+    const socket = new FakeSocket();
+    const service = new RelayService({
+      account,
+      journal,
+      leasePath,
+      socketFactory: () => socket as unknown as RelaySocket,
+    });
+    await service.start({ oneShot: true });
+    socket.open();
+
+    socket.message(inbound(frame));
+
+    await waitFor(() => expect(socket.closes).toContainEqual({ code: 1008, reason: "Relay identity mismatch" }));
+    expect(journal.getLifecycle()).toEqual({ fence: "normal" });
+    await waitFor(() => expect(service.getState()).toBe("stopped"));
   });
 
   it("uses one awaitable signed probe on revoked startup and clears the fence only after open", async () => {
@@ -637,7 +999,11 @@ describe("RelayService", () => {
 
   it("refuses a device-replaced fence without acquiring a lease or creating a socket", async () => {
     const { journal, leasePath } = await createJournal();
-    await journal.setLifecycle("device_replaced", 2);
+    await journal.setLifecycle("device_replaced", 2, {
+      agentId: "agent-1",
+      deviceId: "device-1",
+      enrollmentGeneration: 1,
+    });
     const acquireLease = vi.fn(async () => ({ release: vi.fn(async () => undefined) }));
     const socketFactory = vi.fn(() => new FakeSocket() as unknown as RelaySocket);
     const service = new RelayService({ account, journal, leasePath, acquireLease, socketFactory });
@@ -647,6 +1013,202 @@ describe("RelayService", () => {
     expect(service.getState()).toBe("device_replaced");
     expect(acquireLease).not.toHaveBeenCalled();
     expect(socketFactory).not.toHaveBeenCalled();
+  });
+
+  it("makes one replacement probe and replays rebound frames only after authenticated open", async () => {
+    const { journal, leasePath } = await createJournal();
+    const pending = outbound({
+      ...base,
+      id: "50000000-0000-4000-8000-000000000001",
+      type: "activity",
+      sessionId: "session-1",
+      idempotencyKey: "activity-1",
+      payload: {
+        commandId: "50000000-0000-4000-8000-000000000002",
+        activity: { type: "thought", body: "pending" },
+      },
+    });
+    if (pending.type !== "activity") throw new Error("Unexpected test frame type");
+    await journal.addReplay({ key: "activity", kind: "activity", deliveryId: "delivery-1", frame: pending });
+    await journal.setLifecycle("device_replaced", 2, {
+      agentId: "agent-1",
+      deviceId: "device-1",
+      enrollmentGeneration: 1,
+    });
+    const replacement = { ...account, deviceId: "device-2", enrollmentGeneration: 2 };
+    const socket = new FakeSocket();
+    const timer = new FakeTimer();
+    const socketFactory = vi.fn(() => socket as unknown as RelaySocket);
+    const service = new RelayService({ account: replacement, journal, leasePath, socketFactory, timers: timer });
+
+    const started = service.start();
+    await waitFor(() => expect(socketFactory).toHaveBeenCalledOnce());
+    expect(socket.sent).toEqual([]);
+    expect(journal.getLifecycle().fence).toBe("device_replaced");
+    socket.open();
+
+    await expect(started).resolves.toBe(true);
+    expect(journal.getLifecycle()).toEqual({ fence: "normal" });
+    expect(socket.sent.map((value) => parseOutboundRelayFrame(value).deviceId)).toEqual(["device-2"]);
+    socket.close(1006, "connection lost");
+    await waitFor(() => expect(timer.scheduled).toHaveLength(1));
+    await service.stop();
+  });
+
+  it("reconnects when the authenticated replacement socket closes during journal activation", async () => {
+    const { journal, leasePath } = await createJournal();
+    await journal.setLifecycle("device_replaced", 2, {
+      agentId: "agent-1",
+      deviceId: "device-1",
+      enrollmentGeneration: 1,
+    });
+    const replacement = { ...account, deviceId: "device-2", enrollmentGeneration: 2 };
+    let resumeActivation: (() => void) | undefined;
+    const activationPaused = new Promise<void>((resolve) => {
+      resumeActivation = resolve;
+    });
+    const activateReplacement = journal.activateReplacement.bind(journal);
+    vi.spyOn(journal, "activateReplacement").mockImplementation(async (enrollment) => {
+      await activationPaused;
+      await activateReplacement(enrollment);
+    });
+    const firstSocket = new FakeSocket();
+    const reconnectSocket = new FakeSocket();
+    const sockets = [firstSocket, reconnectSocket];
+    const socketFactory = vi.fn(() => {
+      const socket = sockets.shift();
+      if (socket === undefined) throw new Error("Unexpected relay connection");
+      return socket as unknown as RelaySocket;
+    });
+    const release = vi.fn(async () => undefined);
+    const timer = new FakeTimer();
+    const service = new RelayService({
+      account: replacement,
+      journal,
+      leasePath,
+      socketFactory,
+      timers: timer,
+      acquireLease: vi.fn(async () => ({ release })),
+    });
+
+    const started = service.start();
+    await waitFor(() => expect(socketFactory).toHaveBeenCalledOnce());
+    firstSocket.open();
+    firstSocket.close(1006, "connection lost during activation");
+    await settle();
+
+    expect(journal.getLifecycle().fence).toBe("device_replaced");
+    expect(timer.scheduled).toEqual([]);
+    expect(release).not.toHaveBeenCalled();
+
+    resumeActivation?.();
+    await expect(started).resolves.toBe(true);
+    await waitFor(() => expect(service.getState()).toBe("reconnect_wait"));
+    expect(journal.getLifecycle()).toEqual({ fence: "normal" });
+    expect(timer.scheduled).toHaveLength(1);
+    expect(release).not.toHaveBeenCalled();
+
+    timer.fireNext();
+    expect(socketFactory).toHaveBeenCalledTimes(2);
+    reconnectSocket.open();
+    await waitFor(() => expect(service.getState()).toBe("connected"));
+    expect(release).not.toHaveBeenCalled();
+    await service.stop();
+    expect(release).toHaveBeenCalledOnce();
+  });
+
+  it("fails closed when replacement journal activation fails after authenticated open", async () => {
+    const { journal, leasePath } = await createJournal();
+    await journal.setLifecycle("device_replaced", 2, {
+      agentId: "agent-1",
+      deviceId: "device-1",
+      enrollmentGeneration: 1,
+    });
+    vi.spyOn(journal, "activateReplacement").mockRejectedValue(new Error("disk unavailable"));
+    const socket = new FakeSocket();
+    const release = vi.fn(async () => undefined);
+    const timer = new FakeTimer();
+    const service = new RelayService({
+      account: { ...account, deviceId: "device-2", enrollmentGeneration: 2 },
+      journal,
+      leasePath,
+      timers: timer,
+      socketFactory: () => socket as unknown as RelaySocket,
+      acquireLease: vi.fn(async () => ({ release })),
+    });
+
+    const started = service.start();
+    await waitFor(() => expect(service.getState()).toBe("starting"));
+    socket.open();
+
+    await expect(started).resolves.toBe(false);
+    expect(service.getState()).toBe("device_replaced");
+    expect(journal.getLifecycle()).toMatchObject({ fence: "device_replaced", generation: 2 });
+    expect(socket.closes).toContainEqual({ code: 1011, reason: "Replacement activation failed" });
+    expect(release).toHaveBeenCalledOnce();
+    expect(timer.scheduled).toEqual([]);
+  });
+
+  it("keeps a replacement fence after one failed probe and does not retry", async () => {
+    const { journal, leasePath } = await createJournal();
+    await journal.setLifecycle("device_replaced", 2, {
+      agentId: "agent-1",
+      deviceId: "device-1",
+      enrollmentGeneration: 1,
+    });
+    const socket = new FakeSocket();
+    const timer = new FakeTimer();
+    const socketFactory = vi.fn(() => socket as unknown as RelaySocket);
+    const service = new RelayService({
+      account: { ...account, deviceId: "device-2", enrollmentGeneration: 2 },
+      journal,
+      leasePath,
+      socketFactory,
+      timers: timer,
+    });
+
+    const started = service.start();
+    await waitFor(() => expect(socketFactory).toHaveBeenCalledOnce());
+    socket.close(1006, "network failure");
+
+    await expect(started).resolves.toBe(false);
+    expect(service.getState()).toBe("device_replaced");
+    expect(journal.getLifecycle()).toMatchObject({
+      fence: "device_replaced",
+      enrollment: { deviceId: "device-1" },
+    });
+    expect(timer.scheduled).toEqual([]);
+  });
+
+  it("refreshes an exact rejected replacement probe with the attempted enrollment", async () => {
+    const { journal, leasePath } = await createJournal();
+    await journal.setLifecycle("device_replaced", 2, {
+      agentId: "agent-1",
+      deviceId: "device-1",
+      enrollmentGeneration: 1,
+    });
+    const socket = new FakeSocket();
+    const replacement = { ...account, deviceId: "device-2", enrollmentGeneration: 2 };
+    const socketFactory = vi.fn(() => socket as unknown as RelaySocket);
+    const service = new RelayService({
+      account: replacement,
+      journal,
+      leasePath,
+      socketFactory,
+    });
+
+    const started = service.start();
+    await waitFor(() => expect(socketFactory).toHaveBeenCalledOnce());
+    socket.unexpectedResponse(409, '{"error":"device_replaced"}');
+    await waitFor(() => expect(service.getState()).toBe("device_replaced"));
+    socket.close(1006, "upgrade rejected");
+
+    await expect(started).resolves.toBe(false);
+    expect(journal.getLifecycle()).toEqual({
+      fence: "device_replaced",
+      generation: 2,
+      enrollment: { agentId: "agent-1", deviceId: "device-2", enrollmentGeneration: 2 },
+    });
   });
 
   it("durably fences only the exact stale-generation upgrade response", async () => {
@@ -675,6 +1237,7 @@ describe("RelayService", () => {
     expect(journal.getLifecycle()).toEqual({
       fence: "device_replaced",
       generation: account.enrollmentGeneration,
+      enrollment: { agentId: "agent-1", deviceId: "device-1", enrollmentGeneration: 1 },
     });
     expect(terminal).toEqual(["device_replaced"]);
   });
