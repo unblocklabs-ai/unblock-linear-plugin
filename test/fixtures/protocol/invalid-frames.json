@@ -6,13 +6,29 @@
       "id": "9f66068f-77ab-4f19-8041-901234567890",
       "type": "rpc.request",
       "agentId": "agent-1",
-      "deviceId": "device-1",
       "timestamp": "2026-08-11T12:00:00.000Z",
       "correlationId": "cf641766-cabb-41e3-b166-901234567890",
       "idempotencyKey": "graphql:bad:1",
       "payload": {
         "method": "linear.graphql",
         "params": { "contextId": "context-1", "document": "query { viewer { id } }", "variables": [] }
+      }
+    }
+  },
+  {
+    "name": "legacy deviceId is rejected rather than stripped",
+    "frame": {
+      "v": 1,
+      "id": "9f66068f-77ab-4f19-8041-901234567891",
+      "type": "rpc.request",
+      "agentId": "agent-1",
+      "deviceId": "legacy-device",
+      "timestamp": "2026-08-11T12:00:00.000Z",
+      "correlationId": "cf641766-cabb-41e3-b166-901234567891",
+      "idempotencyKey": "graphql:legacy:1",
+      "payload": {
+        "method": "linear.graphql",
+        "params": { "contextId": "context-1", "document": "query { viewer { id } }", "variables": {} }
       }
     }
   }

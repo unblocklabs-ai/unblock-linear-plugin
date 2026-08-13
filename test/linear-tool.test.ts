@@ -37,7 +37,6 @@ function rpcResult(
     id: uuid(9_000),
     type: "rpc.result",
     agentId: "agent",
-    deviceId: "device",
     timestamp: "2026-08-12T12:00:01.000Z",
     correlationId: request.correlationId,
     ...(request.sessionId === undefined ? {} : { sessionId: request.sessionId }),
@@ -50,7 +49,7 @@ function rpcPort(
 ) {
   const events: string[] = [];
   const port: DurableRpcPort = {
-    getRelayIdentity: () => ({ agentId: "agent", deviceId: "device" }),
+    getRelayIdentity: () => ({ agentId: "agent" }),
     getOrCreateRequest: vi.fn(async (_invocationId, _semanticFingerprint, create) => {
       events.push("persist");
       return create();
@@ -381,7 +380,7 @@ describe("linear tool", () => {
       workerCode: "unauthorized" as const,
       retryable: false,
       expectedCode: "unauthorized",
-      expectedText: "Linear authorization is unavailable. Reauthorize and reconnect the plugin.",
+      expectedText: "This Linear request is no longer authorized.",
       consumed: false,
     },
     {

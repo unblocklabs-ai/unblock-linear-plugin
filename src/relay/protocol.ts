@@ -16,9 +16,8 @@ const envelope = z.object({
   v: z.literal(1),
   id: uuid,
   agentId: identifier,
-  deviceId: identifier,
   timestamp: z.string().datetime({ offset: true }),
-});
+}).strict();
 
 export const agentActivityCommandSchema = z.discriminatedUnion("type", [
   z.object({ type: z.literal("thought"), body: boundedText(4_000), ephemeral: z.boolean().optional() }),
@@ -58,7 +57,7 @@ const controlFrameSchema = envelope.extend({
     z.object({ kind: z.literal("session.stop"), reason: boundedText(1_000).optional() }),
     z.object({ kind: z.literal("team.access_removed"), teamId: identifier }),
     z.object({ kind: z.literal("installation.revoked") }),
-    z.object({ kind: z.literal("device.replaced"), generation: z.number().int().nonnegative() }),
+    z.object({ kind: z.literal("enrollment.replaced"), generation: z.number().int().nonnegative() }),
   ]),
 });
 

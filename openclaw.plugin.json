@@ -15,7 +15,7 @@
   "channelConfigs": {
     "unblock-linear": {
       "label": "Unblock Linear",
-      "description": "Connects an enrolled Linear relay device to OpenClaw.",
+      "description": "Connects an enrolled Linear relay to OpenClaw.",
       "schema": {
         "type": "object",
         "additionalProperties": false,
@@ -36,12 +36,6 @@
             "maxLength": 128,
             "pattern": "^[A-Za-z0-9_-]+$",
             "description": "Worker relay identity only; OpenClaw agent routing uses normal channel bindings."
-          },
-          "deviceId": {
-            "type": "string",
-            "minLength": 1,
-            "maxLength": 128,
-            "pattern": "^[A-Za-z0-9_-]+$"
           },
           "enrollmentGeneration": {
             "type": "integer",

@@ -23,11 +23,10 @@ const timestamp = 1_786_116_800_123;
 const nonceBytes = Uint8Array.from({ length: 32 }, (_value, index) => index);
 const expectedNonce = "AAECAwQFBgcICQoLDA0ODxAREhMUFRYXGBkaGxwdHh8";
 const expectedCanonical = [
-  "unblocked-linear-worker:device-auth:v1",
+  "unblocked-linear-worker:enrollment-auth:v1",
   "method:GET",
-  "path:/v1/relay/agents/agent-alpha/devices/device-mac-mini/ws",
+  "path:/v1/relay/agents/agent-alpha/ws",
   "agent-id:agent-alpha",
-  "device-id:device-mac-mini",
   "enrollment-generation:7",
   `timestamp:${timestamp}`,
   `nonce:${expectedNonce}`,
@@ -37,7 +36,6 @@ function signedUpgrade(randomBytes: (size: number) => Uint8Array = () => nonceBy
   return createSignedDeviceUpgrade({
     origin: "https://linear-staging.unblocklabs.ai",
     agentId: "agent-alpha",
-    deviceId: "device-mac-mini",
     enrollmentGeneration: 7,
     privateKeyJwk: privateJwk,
   }, { now: () => timestamp, randomBytes });
@@ -53,13 +51,12 @@ function configurationError(action: () => unknown): DeviceAuthConfigurationError
   throw new Error("Expected DeviceAuthConfigurationError");
 }
 
-describe("device relay authentication", () => {
-  it("builds the fixed Worker canonical vector without a trailing newline", () => {
+describe("relay enrollment authentication", () => {
+  it("matches the Worker's fixed enrollment-auth canonical vector byte-for-byte", () => {
     const canonical = createDeviceAuthCanonicalMessage({
       method: "GET",
-      path: "/v1/relay/agents/agent-alpha/devices/device-mac-mini/ws",
+      path: "/v1/relay/agents/agent-alpha/ws",
       agentId: "agent-alpha",
-      deviceId: "device-mac-mini",
       enrollmentGeneration: 7,
       timestamp,
       nonce: expectedNonce,
@@ -73,7 +70,7 @@ describe("device relay authentication", () => {
     const upgrade = signedUpgrade();
     const signature = upgrade.headers[DEVICE_AUTH_HEADERS.signature];
 
-    expect(upgrade.url.toString()).toBe("wss://linear-staging.unblocklabs.ai/v1/relay/agents/agent-alpha/devices/device-mac-mini/ws");
+    expect(upgrade.url.toString()).toBe("wss://linear-staging.unblocklabs.ai/v1/relay/agents/agent-alpha/ws");
     expect(upgrade.headers).toMatchObject({
       [DEVICE_AUTH_HEADERS.timestamp]: String(timestamp),
       [DEVICE_AUTH_HEADERS.nonce]: expectedNonce,
@@ -123,7 +120,6 @@ describe("device relay authentication", () => {
     expect(configurationError(() => createSignedDeviceUpgrade({
       origin: "https://linear-staging.unblocklabs.ai",
       agentId: "agent-alpha",
-      deviceId: "device-mac-mini",
       enrollmentGeneration: 7,
       privateKeyJwk: privateJwk,
     }, { now: () => 42, randomBytes: () => nonceBytes })).code).toBe("invalid_timestamp");

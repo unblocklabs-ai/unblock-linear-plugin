@@ -32,9 +32,7 @@ It will register:
 
 - the `unblock-linear` channel;
 - one long-lived relay service;
-- one `linear` tool;
-- the `unblock-linear.reconnect` Gateway method;
-- `openclaw unblock-linear reconnect`.
+- one `linear` tool.
 
 Reference Loggie for supported OpenClaw mechanics, but copy none of the failed
 sibling implementation.
@@ -56,9 +54,9 @@ Add parity fixtures proving that:
 The vendored file will record the Worker source path and revision used. Recheck
 it before release rather than creating a shared protocol package.
 
-## 3. Implement signed device authentication
+## 3. Implement signed enrollment authentication
 
-`src/relay/device-auth.ts` will:
+The existing plugin-side `src/relay/device-auth.ts` module will:
 
 1. Resolve the private JWK through OpenClaw's SecretRef API.
 2. Verify it is a private P-256 key.
@@ -80,7 +78,7 @@ It will persist:
 - delivery lifecycle state;
 - exact unresolved activity frames;
 - exact unresolved RPC frames and results;
-- revoked/device-replaced state;
+- revoked/enrollment-replaced state;
 - durable insertion order.
 
 Properties:
@@ -105,7 +103,7 @@ starting
    ├─► connected
    ├─► reconnect_wait
    ├─► revoked
-   ├─► device_replaced
+   ├─► enrollment_replaced
    └─► stopped
 ```
 
@@ -119,7 +117,7 @@ It will own exactly one socket and:
 - prevent two sockets from operating concurrently;
 - await persistence and socket closure during shutdown.
 
-`revoked` and `device_replaced` remain distinct terminal conditions.
+`revoked` and `enrollment_replaced` remain distinct terminal conditions.
 
 ## 6. Integrate the OpenClaw channel
 
@@ -224,30 +222,33 @@ Each active delivery gets its own abort controller.
 - `team.access_removed` cancels known affected Linear sessions.
 - `installation.revoked` aborts everything, persists revoked state, closes the
   socket, and disables automatic reconnect.
-- `device.replaced` additionally fences the enrolled generation.
+- `enrollment.replaced` additionally fences the enrolled generation.
 
 The plugin will not pretend that aborting OpenClaw can roll back an external
 side effect already completed.
 
-## 11. Implement explicit reconnect
+## 11. Recover through enrollment replacement
 
-The CLI calls the running Gateway:
+An `installation.revoked` control is terminal for the configured enrollment.
+The operator provisions a replacement from the Worker repository:
 
 ```text
-openclaw unblock-linear reconnect
+npm run setup:agent -- replace --agent-id <existing-agent-id>
         │
         ▼
-unblock-linear.reconnect
+new private app plus strictly newer enrollment generation
         │
         ▼
-one fresh signed connection attempt
+update OpenClaw config/SecretRef and restart
 ```
 
-- Success clears revoked state and restarts normal reconnect behavior.
-- Failure preserves revoked state.
-- A device-replacement fence returns instructions to update enrollment.
-- OpenClaw startup performs the same single probe.
-- There is no OAuth polling.
+- Replacement does not expose Linear credentials to the plugin.
+- Replacement does not disable an otherwise-active old installation and
+  enrollment until Worker verification and atomic activation succeed; an
+  already-revoked installation remains offline.
+- Startup refuses an unchanged, rolled-back, or cross-agent enrollment.
+- Only a strictly newer same-agent generation may clear either persisted fence;
+  authenticated startup clears it atomically without rewriting replay identity.
 
 ## 12. Handle process-crash recovery
 
@@ -285,7 +286,7 @@ configuration, and other arbitrary tools are not transactionally exactly-once.
 - stable `sessionTarget`;
 - full tool-policy preservation;
 - cancellation;
-- CLI-to-Gateway reconnect;
+- replacement-enrollment startup recovery;
 - cold and mock-runtime inspection.
 
 ### Packaging
@@ -299,9 +300,9 @@ configuration, and other arbitrary tools are not transactionally exactly-once.
 
 ### Staging
 
-Using the enrolled test device:
+Using the enrolled test agent:
 
-1. Connect with the enrolled test device; the simulator is disabled.
+1. Connect with the enrolled test agent; the simulator is disabled.
 2. Exercise authenticated queries and a reversible mutation.
 3. Test disconnect/replay and controls.
 4. Test a managed upload.

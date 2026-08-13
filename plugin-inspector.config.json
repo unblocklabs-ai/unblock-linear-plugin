@@ -3,10 +3,10 @@
   "plugin": {
     "id": "unblock-linear",
     "priority": "high",
-    "seams": ["manifest-contract", "sdk-surface", "channel", "dynamic-tool", "gateway-service", "cli"],
+    "seams": ["manifest-contract", "sdk-surface", "channel", "dynamic-tool", "gateway-service"],
     "sourceRoot": ".",
     "expect": {
-      "registrations": ["registerChannel", "registerTool", "registerService", "registerGatewayMethod", "registerCli"],
+      "registrations": ["registerChannel", "registerTool", "registerService"],
       "manifestContracts": ["tools"]
     }
   },

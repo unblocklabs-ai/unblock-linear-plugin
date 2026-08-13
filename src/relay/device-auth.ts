@@ -18,7 +18,6 @@ export interface DeviceAuthCanonicalMessageInput {
   method: string;
   path: string;
   agentId: string;
-  deviceId: string;
   enrollmentGeneration: number;
   timestamp: number;
   nonce: string;
@@ -27,7 +26,6 @@ export interface DeviceAuthCanonicalMessageInput {
 export interface DeviceAuthUpgradeInput {
   origin: string;
   agentId: string;
-  deviceId: string;
   enrollmentGeneration: number;
   privateKeyJwk: JsonWebKey;
 }
@@ -44,7 +42,7 @@ export interface SignedDeviceUpgrade {
 
 export class DeviceAuthConfigurationError extends Error {
   constructor(readonly code: "invalid_identity" | "invalid_generation" | "invalid_timestamp" | "invalid_nonce" | "invalid_origin" | "invalid_private_key" | "invalid_randomness") {
-    super("Invalid device authentication configuration");
+    super("Invalid enrollment authentication configuration");
     this.name = "DeviceAuthConfigurationError";
   }
 }
@@ -68,7 +66,7 @@ function isCanonicalBase64Url(value: unknown, expectedLength: number): value is 
   return decoded.byteLength === expectedLength && decoded.toString("base64url") === value;
 }
 
-/** Validates exactly the private JWK shape accepted for P-256 device signing. */
+/** Validates exactly the private JWK shape accepted for P-256 enrollment signing. */
 export function parsePrivateP256Jwk(value: unknown): JsonWebKey {
   if (value === null || typeof value !== "object" || Array.isArray(value)) {
     throw new DeviceAuthConfigurationError("invalid_private_key");
@@ -100,7 +98,7 @@ export function createDeviceAuthCanonicalMessage(input: DeviceAuthCanonicalMessa
   if (input.method !== "GET" || !isValidPath(input.path)) {
     throw new DeviceAuthConfigurationError("invalid_origin");
   }
-  if (!isValidIdentifier(input.agentId) || !isValidIdentifier(input.deviceId)) {
+  if (!isValidIdentifier(input.agentId)) {
     throw new DeviceAuthConfigurationError("invalid_identity");
   }
   if (!Number.isSafeInteger(input.enrollmentGeneration) || input.enrollmentGeneration < 1) {
@@ -114,18 +112,17 @@ export function createDeviceAuthCanonicalMessage(input: DeviceAuthCanonicalMessa
   }
 
   return encoder.encode([
-    "unblocked-linear-worker:device-auth:v1",
+    "unblocked-linear-worker:enrollment-auth:v1",
     `method:${input.method}`,
     `path:${input.path}`,
     `agent-id:${input.agentId}`,
-    `device-id:${input.deviceId}`,
     `enrollment-generation:${String(input.enrollmentGeneration)}`,
     `timestamp:${String(input.timestamp)}`,
     `nonce:${input.nonce}`,
   ].join("\n"));
 }
 
-function createRelayWebSocketUrl(origin: string, agentId: string, deviceId: string): URL {
+function createRelayWebSocketUrl(origin: string, agentId: string): URL {
   let base: URL;
   try {
     base = new URL(origin);
@@ -137,7 +134,7 @@ function createRelayWebSocketUrl(origin: string, agentId: string, deviceId: stri
   }
   base.protocol = base.protocol === "https:" ? "wss:" : "ws:";
   return new URL(
-    `/v1/relay/agents/${encodeURIComponent(agentId)}/devices/${encodeURIComponent(deviceId)}/ws`,
+    `/v1/relay/agents/${encodeURIComponent(agentId)}/ws`,
     base,
   );
 }
@@ -157,12 +154,11 @@ export function createSignedDeviceUpgrade(
     throw new DeviceAuthConfigurationError("invalid_randomness");
   }
   const nonce = Buffer.from(nonceBytes).toString("base64url");
-  const url = createRelayWebSocketUrl(input.origin, input.agentId, input.deviceId);
+  const url = createRelayWebSocketUrl(input.origin, input.agentId);
   const canonicalMessage = createDeviceAuthCanonicalMessage({
     method: "GET",
     path: url.pathname,
     agentId: input.agentId,
-    deviceId: input.deviceId,
     enrollmentGeneration: input.enrollmentGeneration,
     timestamp,
     nonce,

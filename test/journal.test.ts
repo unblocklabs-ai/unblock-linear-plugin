@@ -32,7 +32,6 @@ function frame(id: number, type: "activity" | "rpc.request" = "activity"): Activ
   id: uuid(id),
   type,
   agentId: "agent",
-  deviceId: "device",
   timestamp: "2026-08-12T12:00:00.000Z",
   ...(type === "rpc.request" ? { correlationId: uuid(1_000 + id), idempotencyKey: `request-${id}` } : {
     sessionId: "linear-session",
@@ -55,7 +54,6 @@ function statusFrame(
     id: uuid(id),
     type: "delivery.status",
     agentId: "agent",
-    deviceId: "device",
     timestamp: "2026-08-12T12:00:00.000Z",
     sessionId: "linear-session",
     idempotencyKey: `idempotency-${deliveryId}`,
@@ -73,7 +71,6 @@ function acknowledgementFrame(
     id: uuid(id),
     type: "delivery.ack",
     agentId: "agent",
-    deviceId: "device",
     timestamp: "2026-08-12T12:00:01.000Z",
     sessionId: "linear-session",
     idempotencyKey: `idempotency-${deliveryId}`,
@@ -98,7 +95,6 @@ function resultFrame(
     id: uuid(8_000),
     type: "rpc.result",
     agentId: request.agentId,
-    deviceId: request.deviceId,
     timestamp: "2026-08-12T12:00:01.000Z",
     correlationId: request.correlationId,
     ...(request.sessionId === undefined ? {} : { sessionId: request.sessionId }),
@@ -151,9 +147,8 @@ async function journalFixture(options: RelayJournalOptions = {}) {
 describe("RelayJournal", () => {
   it("atomically persists and reloads the complete v1 state with restrictive permissions", async () => {
     const { path, journal } = await journalFixture();
-    await journal.setLifecycle("device_replaced", 2, {
+    await journal.setLifecycle("enrollment_replaced", 2, {
       agentId: "agent",
-      deviceId: "device",
       enrollmentGeneration: 1,
     });
     await journal.bindSession(binding());
@@ -162,53 +157,56 @@ describe("RelayJournal", () => {
     await journal.recordUpload({ uploadId: "upload-1", ownerId: "delivery-1", fileRef: "media://inbound/opaque", status: "uploading", graphqlCorrelationId: "corr", recordedAt: "2026-08-12T12:00:00.000Z" });
 
     const reloaded = await RelayJournal.open(path);
-    expect(reloaded.snapshot()).toMatchObject({ lifecycle: { fence: "device_replaced", generation: 2 }, replay: [{ key: "activity-1" }] });
+    expect(reloaded.snapshot()).toMatchObject({ lifecycle: { fence: "enrollment_replaced", generation: 2 }, replay: [{ key: "activity-1" }] });
     expect((await stat(path)).mode & 0o777).toBe(0o600);
     await expect(readFile(`${path}.tmp`)).rejects.toMatchObject({ code: "ENOENT" });
   });
 
-  it("atomically rebinds replacement replay and RPC identities before clearing the fence", async () => {
+  it("atomically validates replay and RPC identities before clearing the fence", async () => {
     const { path, journal } = await journalFixture();
     const request = frame(10, "rpc.request");
     await journal.recordRpcInvocation("tool-call", fingerprint(), request);
     await journal.recordRpcResult(resultFrame(request));
     await journal.addReplay({ key: "activity", kind: "activity", deliveryId: "delivery-1", frame: frame(11) });
-    await journal.setLifecycle("device_replaced", 2, {
+    await journal.setLifecycle("enrollment_replaced", 2, {
       agentId: "agent",
-      deviceId: "device",
       enrollmentGeneration: 1,
     });
 
     await journal.activateReplacement({
       agentId: "agent",
-      deviceId: "replacement-device",
       enrollmentGeneration: 2,
     });
 
     const reloaded = await RelayJournal.open(path);
     expect(reloaded.getLifecycle()).toEqual({ fence: "normal" });
-    expect(reloaded.getReplayEntries().every((entry) => entry.frame.deviceId === "replacement-device"))
-      .toBe(true);
-    expect(reloaded.getRpcInvocation("tool-call")).toMatchObject({
-      request: { deviceId: "replacement-device" },
-      result: { deviceId: "replacement-device" },
-    });
   });
 
   it("rejects cross-agent replacement activation without changing fenced state", async () => {
     const { journal } = await journalFixture();
     await journal.addReplay({ key: "activity", kind: "activity", deliveryId: "delivery-1", frame: frame(1) });
-    await journal.setLifecycle("device_replaced", 2, {
+    await journal.setLifecycle("enrollment_replaced", 2, {
       agentId: "agent",
-      deviceId: "device",
       enrollmentGeneration: 1,
     });
     const before = journal.snapshot();
 
     await expect(journal.activateReplacement({
       agentId: "other-agent",
-      deviceId: "replacement-device",
       enrollmentGeneration: 2,
+    })).rejects.toBeInstanceOf(JournalError);
+    expect(journal.snapshot()).toEqual(before);
+  });
+
+  it.each([1, 0])("rejects replacement generation %s without changing a revoked fence", async (generation) => {
+    const { journal } = await journalFixture();
+    const enrollment = { agentId: "agent", enrollmentGeneration: 1 };
+    await journal.setLifecycle("revoked", enrollment);
+    const before = journal.snapshot();
+
+    await expect(journal.activateReplacement({
+      agentId: "agent",
+      enrollmentGeneration: generation,
     })).rejects.toBeInstanceOf(JournalError);
     expect(journal.snapshot()).toEqual(before);
   });

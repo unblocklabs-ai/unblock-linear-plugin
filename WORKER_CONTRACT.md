@@ -3,7 +3,7 @@
 ## Purpose
 
 This document records the current contract between the OpenClaw plugin and the
-Cloudflare Worker working trees as of 2026-08-12. It is an implementation and
+Cloudflare Worker working trees as of 2026-08-13. It is an implementation and
 operations reference, not proof that either configured origin is currently
 running these exact working trees. Verify deployed versions and live acceptance
 separately before release.
@@ -11,23 +11,23 @@ separately before release.
 The intended product boundary is:
 
 ```text
-Linear     owns OAuth scopes, resource access, authorization, and workspace truth
-Cloudflare owns Linear credentials plus relay-side transport, durability, and replay
+Linear     owns app scopes, resource access, authorization, and workspace truth
+Cloudflare owns Linear credentials, access-token minting, relay transport, durability, and replay
 OpenClaw   owns agent execution, conversation state, and the plugin's local replay journal
 ```
 
 The plugin must make Linear feel like a normal agent integration. Relay concepts
-such as Durable Objects, delivery IDs, device generations, request correlation,
-and retries must not be exposed to the model.
+such as Durable Objects, delivery IDs, enrollment generations, request
+correlation, and retries must not be exposed to the model.
 
 The minimum supported OpenClaw version is `2026.7.2-beta.7`.
 
 ## Configured origins and source of truth
 
 - Staging origin: `https://linear-staging.unblocklabs.ai`
-- Staging WebSocket: `wss://linear-staging.unblocklabs.ai/v1/relay/agents/{agentId}/devices/{deviceId}/ws`
+- Staging WebSocket: `wss://linear-staging.unblocklabs.ai/v1/relay/agents/{agentId}/ws`
 - Production origin: `https://linear.unblocklabs.ai`
-- Production WebSocket: `wss://linear.unblocklabs.ai/v1/relay/agents/{agentId}/devices/{deviceId}/ws`
+- Production WebSocket: `wss://linear.unblocklabs.ai/v1/relay/agents/{agentId}/ws`
 - Protocol version: `1`
 
 The Worker Wrangler configurations target these origins. The repositories do
@@ -46,12 +46,12 @@ than prose if the code changes:
 ```text
 scope.md                         product boundary only; implementation/test details may be stale
 src/protocol/relay.ts            exact frame runtime schema and byte bounds
-src/security/device-auth.ts      exact signed-upgrade authentication
+src/security/enrollment-auth.ts  exact signed-upgrade authentication
 src/agent-relay-do.ts            durable lifecycle, replay, and control behavior
-src/http/router.ts               public routes, webhook/OAuth flow, and relay upgrade
+src/http/router.ts               public routes, webhooks, and relay upgrade
 src/http/provisioning-admin.ts   current operator provisioning API
 src/registry/                    provisioning and enrollment persistence
-scripts/bootstrap-production.mjs reservation/completion operator client
+scripts/bootstrap-production.mjs interactive create/resume/status/replace client
 
 # In this plugin checkout:
 src/relay/journal.ts             crash-safe local replay and lifecycle journal
@@ -79,12 +79,11 @@ The plugin owns only:
 7. Translation of OpenClaw progress/final output into Linear Agent Activities.
 8. A model-facing `linear` tool backed by the private `linear.graphql` method.
 9. Cancellation/abort handling for control frames.
-10. A plugin-owned reconnect CLI for explicit recovery after OAuth revocation.
-11. Content-free channel status and configuration-only doctor warnings.
+10. Content-free channel status and configuration-only doctor warnings.
 
 The plugin does **not** own:
 
-- Linear OAuth, access tokens, refresh tokens, or client secrets;
+- Linear private-app credentials or access tokens;
 - Linear webhook verification;
 - team, resource, field, or operation authorization;
 - a mirrored Linear permissions database;
@@ -93,20 +92,19 @@ The plugin does **not** own:
 - a general URL proxy.
 
 Linear decides whether a GraphQL operation is allowed. The Worker authenticates
-the device, binds it to exactly one installed Linear app identity, attaches that
-identity's current OAuth token, and forwards the operation to the fixed Linear
-GraphQL endpoint.
+the agent enrollment, binds it to exactly one installed Linear app identity,
+mints a short-lived access token through the client-credentials grant, and
+forwards the operation to the fixed Linear GraphQL endpoint.
 
 ## Required plugin configuration
 
 The runtime configuration lives under `channels.unblock-linear` and needs one
-already-enrolled device bundle:
+already-enrolled agent bundle:
 
 ```ts
 type UnblockedLinearPluginConfig = {
   origin: "https://linear-staging.unblocklabs.ai" | "https://linear.unblocklabs.ai";
   agentId: string;                 // Worker relay identity; 1..128, [A-Za-z0-9_-]
-  deviceId: string;                // 1..128, [A-Za-z0-9_-]
   enrollmentGeneration: number;    // positive integer
   devicePrivateKey: SecretRef;      // private P-256 JWK, never plain config/log output
 };
@@ -115,47 +113,61 @@ type UnblockedLinearPluginConfig = {
 The corresponding public JWK and generation are already stored in the Worker
 registry. The private JWK stays on the OpenClaw host.
 
-For staging validation, provision a dedicated enrolled device through the
+For staging validation, provision a dedicated enrolled agent through the
 operator API. Keep its private key outside both repositories and never copy it
 into plugin source, package contents, fixtures, logs, or commits.
 
-The plugin must not embed or request:
+The plugin must not embed, receive, or request:
 
 - `ADMIN_API_TOKEN`;
-- a Linear access/refresh token;
-- the Linear OAuth client secret;
+- a Linear access token;
+- the Linear private-app client ID or client secret;
 - the Linear webhook signing secret;
 - the Cloudflare control-plane key.
 
-Provisioning is an operator-only, two-step API authenticated with
-`Authorization: Bearer <ADMIN_API_TOKEN>`:
+Provisioning is operator-only and driven from the Worker repository. The admin
+token is accepted only through the environment:
 
-1. `POST /v1/admin/agents/reservations` accepts an idempotency key, display
-   name, agent, installation, organization, device ID, and public P-256 JWK. It
-   creates a 15-minute reservation and returns its opaque ID, webhook route and
-   URL, expiry, and exact completion URL.
-2. `POST /v1/admin/agents/reservations/{reservationId}/complete` supplies the
-   Linear OAuth client ID and scopes plus the OAuth client secret and webhook
-   secret. The Worker encrypts the two secrets, stores the client ID and
-   normalized scopes, creates or enables the installation record, and activates
-   the reserved device. It returns the installation details and an
-   `oauthStartUrl`; webhook delivery remains not-ready until OAuth completes.
-3. An operator follows `oauthStartUrl`; the callback at
-   `/v1/linear/oauth/callback` verifies the Linear identity, stores the OAuth
-   token bundle, marks the installation ready for webhook delivery, then
-   initializes and restores the relay.
+```sh
+npm run setup:agent -- create
+npm run setup:agent -- resume
+npm run setup:agent -- status
+npm run setup:agent -- replace --agent-id <existing-agent-id>
+```
 
-The operator may drive this flow with `scripts/bootstrap-production.mjs`. The
-private device JWK is generated and retained outside the Worker; only its public
-JWK is reserved. The current reservation/completion responses do not return the
-private key or assigned `enrollmentGeneration`; provisioning automation must
-retain the private key and provide the assigned generation to the OpenClaw
-configuration separately.
+`create` generates a private P-256 enrollment key locally and sends only its
+public JWK to `POST /v1/admin/agents/reservations`, authenticated with
+`Authorization: Bearer <ADMIN_API_TOKEN>`. The Worker creates server-generated
+agent, installation, and webhook identities. The CLI opens Linear's
+prefilled private-app form with the unique webhook and required scopes, then
+collects the app's client ID, client secret, and webhook signing secret without
+echoing them.
+
+The CLI sends those app credentials directly to the reservation's completion
+endpoint. Before atomic activation, the Worker obtains a short-lived token
+through `client_credentials` and verifies the app user, expected organization,
+required scopes, and Agent Sessions support. The Worker encrypts the long-lived
+client and webhook credentials; it does not persist the access token. Although
+Linear currently requires `authorization_code` in every app manifest, the
+Worker never starts that grant, exposes a callback, or asks for user consent.
+
+The CLI persists only resumable non-credential setup state and the private JWK
+in separate mode-`0600` files. `status` is local-only; `resume` continues a
+pending reservation. Successful completion prints the safe enrollment bundle:
+`origin`, `agentId`, `enrollmentGeneration`, and
+`privateKeyFile`. The operator moves the key into an OpenClaw-approved
+secret store and supplies the printed values to the plugin.
+
+`replace` uses the same flow for an existing `agentId`. An otherwise-active
+current installation and enrollment remain active until the replacement
+credentials are verified and the new generation is atomically activated; an
+already-revoked installation remains offline. Worker-side replacement does not
+delete the old private app in Linear.
 
 These admin endpoints are not plugin APIs. The staging and production Worker
 entrypoints wire the same routes behind each deployment's respective
 `ADMIN_API_TOKEN` binding; source alone does not prove live reachability. There
-is no device self-registration endpoint. The plugin therefore consumes an
+is no agent self-registration endpoint. The plugin therefore consumes an
 enrollment bundle supplied by the operator; do not add registration to the
 plugin without a separate control-plane contract.
 
@@ -203,11 +215,10 @@ For every connection attempt:
 Canonical bytes:
 
 ```text
-unblocked-linear-worker:device-auth:v1
+unblocked-linear-worker:enrollment-auth:v1
 method:GET
-path:/v1/relay/agents/{URL-encoded-agentId}/devices/{URL-encoded-deviceId}/ws
+path:/v1/relay/agents/{URL-encoded-agentId}/ws
 agent-id:{agentId}
-device-id:{deviceId}
 enrollment-generation:{positive integer}
 timestamp:{Unix milliseconds}
 nonce:{43-character base64url nonce}
@@ -229,17 +240,16 @@ import { createPrivateKey, randomBytes, sign } from "node:crypto";
 import WebSocket from "ws";
 
 const url = new URL(
-  `/v1/relay/agents/${encodeURIComponent(agentId)}/devices/${encodeURIComponent(deviceId)}/ws`,
+  `/v1/relay/agents/${encodeURIComponent(agentId)}/ws`,
   origin.replace(/^http/, "ws"),
 );
 const timestamp = Date.now();
 const nonce = randomBytes(32).toString("base64url");
 const canonical = Buffer.from([
-  "unblocked-linear-worker:device-auth:v1",
+  "unblocked-linear-worker:enrollment-auth:v1",
   "method:GET",
   `path:${url.pathname}`,
   `agent-id:${agentId}`,
-  `device-id:${deviceId}`,
   `enrollment-generation:${enrollmentGeneration}`,
   `timestamp:${timestamp}`,
   `nonce:${nonce}`,
@@ -261,10 +271,10 @@ const socket = new WebSocket(url, {
 
 The Worker accepts at most 60 seconds of clock skew and atomically consumes each
 nonce. Reusing a nonce returns HTTP 409. Invalid/stale signatures return 401.
-Disabled agents, inactive devices, or revoked installations return 403.
+Disabled agents, inactive enrollments, or revoked installations return 403.
 
-Only one active device connection exists per logical agent. A newer connection
-or enrolled generation closes the old connection with code `4001`. Installation
+Only one active connection exists per logical agent. A newer connection or
+enrollment generation closes the old connection with code `4001`. Installation
 revocation sends a control and closes with `4003`.
 
 ## Frame envelope
@@ -277,7 +287,6 @@ type BaseFrame = {
   id: string;             // UUID, unique frame identity
   type: string;
   agentId: string;
-  deviceId: string;
   timestamp: string;      // ISO 8601 with timezone/offset
   sessionId?: string;     // Linear AgentSession ID, not an OpenClaw session ID
   correlationId?: string; // UUID, RPC only
@@ -286,13 +295,9 @@ type BaseFrame = {
 };
 ```
 
-Validate every frame before acting. Also verify that inbound `agentId` and
-`deviceId` match the configured connection identity. The only identity exception
-is a same-agent `device.replaced` control whose generation is strictly newer
-than the connected enrollment: the Worker stamps that control with the
-replacement device ID before closing the old socket. Any other malformed or
-identity-mismatched device frame closes the connection with code `1008`; an
-oversized frame closes with `1009`.
+Validate every frame before acting and verify that inbound `agentId` matches the
+configured relay identity. Any malformed or identity-mismatched frame closes
+the connection with code `1008`; an oversized frame closes with `1009`.
 
 Frame directions:
 
@@ -352,7 +357,6 @@ Acceptance:
   "id": "10000000-0000-4000-8000-000000000001",
   "type": "delivery.accept",
   "agentId": "test-agent",
-  "deviceId": "test-device",
   "sessionId": "linear-agent-session-id",
   "idempotencyKey": "20000000-0000-4000-8000-000000000002",
   "timestamp": "2026-08-12T12:00:00.000Z",
@@ -391,7 +395,7 @@ with the same `deliveryId` and `idempotencyKey`; recover the same OpenClaw
 conversation under the process-crash policy below and replay the exact locally
 unresolved frames.
 
-The Worker acknowledges each applied device status, including an identical
+The Worker acknowledges each applied delivery status, including an identical
 terminal status replay, with:
 
 ```ts
@@ -490,7 +494,7 @@ type LinearToolInput =
 ```
 
 The plugin fills in the private transport identities. The model must not supply
-`agentId`, `deviceId`, `contextId`, `sessionId`, `correlationId`, or
+`agentId`, `contextId`, `sessionId`, `correlationId`, or
 `idempotencyKey`.
 
 Use the private `linear.graphql` request:
@@ -547,7 +551,6 @@ Example context-only query:
   "id": "30000000-0000-4000-8000-000000000003",
   "type": "rpc.request",
   "agentId": "test-agent",
-  "deviceId": "test-device",
   "timestamp": "2026-08-12T12:00:01.000Z",
   "correlationId": "40000000-0000-4000-8000-000000000004",
   "idempotencyKey": "50000000-0000-4000-8000-000000000005",
@@ -679,7 +682,7 @@ type ControlPayload =
   | { kind: "session.stop"; reason?: string }
   | { kind: "team.access_removed"; teamId: string }
   | { kind: "installation.revoked" }
-  | { kind: "device.replaced"; generation: number }; // nonnegative in protocol; enrolled generations are positive
+  | { kind: "enrollment.replaced"; generation: number }; // nonnegative in protocol; enrolled generations are positive
 ```
 
 Behavior:
@@ -696,24 +699,25 @@ Behavior:
   This is an operational signal, not a Cloudflare authorization rule for future
   generic GraphQL; Linear remains authoritative.
 - `installation.revoked`: abort all work, reject new `linear` tool calls, clear
-  reconnect timers, persist a local revoked state, and remain offline until OAuth
-  is reauthorized and an operator explicitly requests a reconnect or OpenClaw
-  restarts.
-- `device.replaced`: stop using the old generation and require a newly supplied
-  enrollment bundle. Persist the replacement fence and do not reconnect with the
-  stale key/generation. The fence records the old enrollment identity and a
-  generation floor: the control payload generation when a control was received,
-  or the attempted configured generation for an exact stale-upgrade `409`. Only
-  a compatible updated configuration can probe.
+  reconnect timers, persist a local revoked state, and remain offline while the
+  same enrollment is configured. Recovery requires Worker-side replacement,
+  updated plugin configuration and SecretRef, and an OpenClaw restart.
+- `enrollment.replaced`: stop using the old generation and require a newly
+  supplied enrollment bundle. Persist the replacement fence and do not reconnect
+  with the stale key/generation. Require the control payload generation to be
+  strictly newer than the connected generation. The fence records the stale
+  enrolled agent identity and the expected replacement generation from the
+  control; an exact stale-upgrade `409` records the attempted generation as both.
+  Only the same agent with a strictly newer generation can probe, and it must
+  meet or exceed an expected replacement generation supplied by a control.
 
-When an enrolled generation rotates while connected, the Worker attempts to
-send `device.replaced`, stamped with the replacement device identity, before
-closing the old socket with code `4001`. The plugin drains already-queued inbound
-frames before finalizing the close so a successfully queued control cannot be
-lost to the immediate close. For an otherwise active device, a stale generation
-presented during a new signed upgrade receives content-free HTTP
-`409 {"error":"device_replaced"}`; other signed-authentication failures remain
-generic.
+When an enrollment generation rotates while connected, the Worker attempts to
+send `enrollment.replaced` before closing the old socket with code `4001`. The
+plugin drains already-queued inbound frames before finalizing the close so a
+successfully queued control cannot be lost to the immediate close. A stale
+generation presented during a new signed upgrade receives content-free HTTP
+`409 {"error":"enrollment_replaced"}`; other signed-authentication failures
+remain generic.
 
 Controls can arrive immediately on reconnect. Apply them before resuming work.
 
@@ -722,10 +726,9 @@ Controls can arrive immediately on reconnect. Apply them before resuming work.
 - Use bounded exponential backoff with jitter for abnormal network closes.
 - Generate new signed-upgrade authentication for every attempt.
 - Do not automatically reconnect after an intentional plugin shutdown,
-  installation revocation, or device replacement while the same enrollment is
-  configured. Revocation permits only the explicit CLI attempt and the single
-  startup attempt defined below. Device replacement permits only the compatible
-  updated-enrollment startup probe defined below; the CLI never bypasses it.
+  installation revocation, or enrollment replacement while the same enrollment
+  is configured. Both require a same-agent, strictly newer enrollment supplied
+  through configuration.
 - A new successful connection replaces the old socket; never operate both.
 - On reconnect, replay exact unresolved local activity, delivery-status, and RPC
   frames in durable insertion order.
@@ -734,37 +737,20 @@ Controls can arrive immediately on reconnect. Apply them before resuming work.
   create a second conversation.
 - Make plugin shutdown await journal persistence and socket closure.
 
-Register a plugin CLI command:
+There is no plugin-owned operator reconnect command. For
+`installation.revoked`, run `npm run setup:agent -- replace --agent-id
+<existing-agent-id>` from the Worker repository, update the plugin enrollment
+and private-key SecretRef, then restart OpenClaw. Startup must not use the old
+enrollment to bypass the persisted revoked state.
 
-```text
-openclaw unblock-linear reconnect
-```
-
-Implement it through a plugin-owned Gateway method such as
-`unblock-linear.reconnect`, using the supported plugin CLI and Gateway client
-APIs. Its behavior is:
-
-1. It tells the running plugin service to make exactly one fresh signed
-   connection attempt.
-2. Success clears the persisted revoked state and resumes normal bounded
-   automatic reconnect behavior.
-3. Failure preserves the revoked state and returns a useful content-free error.
-4. It refuses to bypass a `device.replaced` fence or use a stale enrollment
-   generation, and instructs the operator to update the enrollment configuration.
-5. It does not poll for OAuth reauthorization.
-
-On OpenClaw startup, perform one fresh signed connection attempt even when the
-persisted state is `installation.revoked`. Success clears the revoked state;
-failure leaves the service revoked and requires the explicit reconnect command.
-
-For a persisted `device.replaced` fence, startup refuses unchanged, rollback,
-and cross-agent configuration without opening a socket. If configuration has
-changed to a same-agent enrollment whose generation is not below the fenced
-replacement generation, startup makes one authenticated probe. Only a
-WebSocket `open` activates it: replay and stored RPC frame device IDs are
-atomically rebound to the configured device before the fence clears and replay
-begins. A failed probe or activation keeps the replacement fence and does not
-retry automatically.
+For a persisted revocation or `enrollment.replaced` fence, startup refuses
+unchanged, rollback, and cross-agent configuration without opening a socket. If
+configuration has changed to the same agent with a generation strictly newer
+than the fenced enrollment—and at least the expected replacement generation
+when one was supplied—startup makes one authenticated probe. A WebSocket `open`
+atomically validates the persisted frame agent IDs and clears the fence before
+replay begins; replay requires no identity rewriting. A failed probe keeps the
+fence and does not retry automatically.
 
 ## Files and attachments
 
@@ -803,7 +789,7 @@ signed URLs handled through OpenClaw's normal approved download mechanism.
 
 Allowed diagnostic metadata:
 
-- agent ID, device ID, and enrollment generation;
+- agent ID and enrollment generation;
 - connection/reconnect status and close code;
 - frame type and frame ID;
 - delivery/request state counts and oldest age;
@@ -844,10 +830,9 @@ index.ts                   defineChannelPluginEntry and thin registrations only
 setup-entry.ts             setup-safe channel metadata
 src/channel.ts             channel account, status, doctor, and secret metadata
 src/config.ts              channel-root config parsing and SecretRef boundary
-src/integration.ts         service/tool wiring, media resolution, and reconnect state
-src/reconnect.ts           CLI and operator-write Gateway method
+src/integration.ts         service/tool wiring, media resolution, and relay state
 src/relay/protocol.ts      vendored exact protocol-v1 Zod schema
-src/relay/device-auth.ts   canonical signing
+src/relay/device-auth.ts   plugin-side canonical signing implementation
 src/relay/service.ts       one socket, reconnect, replay, and controls
 src/relay/journal.ts       bounded private exact replay state
 src/relay/lease.ts         single-writer journal ownership
@@ -857,11 +842,10 @@ test/                      protocol, replay, control, tool, and runtime tests
 ```
 
 Use the supported channel entrypoint and inbound pipeline, `registerService` for
-the long-lived relay connection, `registerTool` for the `linear` tool,
-`registerGatewayMethod` for the reconnect operation, and `registerCli` for the
-operator command, subject to the exact OpenClaw 2026.7.2-beta.7 SDK. Keep entrypoint
-registration thin. Do not add a provider-neutral transport layer, configurable
-scheduler, multiple-device manager, generic job framework, or mirrored Linear
+the long-lived relay connection, and `registerTool` for the `linear` tool,
+subject to the exact OpenClaw 2026.7.2-beta.7 SDK. Keep entrypoint registration
+thin. Do not add a provider-neutral transport layer, configurable scheduler,
+multiple-enrollment manager, generic job framework, or mirrored Linear
 SDK/schema.
 
 The package and manifest align, and `npm run preflight` covers:
@@ -881,7 +865,7 @@ prove either one.
 ## Required validation before release
 
 1. Exact P-256 canonical bytes, raw signature encoding, skew, nonce, and headers.
-2. Authenticated staging connection using an enrolled test device.
+2. Authenticated staging connection using an enrolled test agent.
 3. Created delivery persists a binding before acceptance.
 4. Standard channel binding selects the OpenClaw agent independently from the
    Worker relay `agentId`, and default-agent routing works without a binding.
@@ -908,15 +892,17 @@ prove either one.
     inspect-and-reconcile guidance before any repeated side effect.
 20. Accepted/started delivery replay never creates a second OpenClaw conversation.
 21. Stop aborts only the matching session; context-only GraphQL stays usable.
-22. OAuth revocation aborts work, persists revoked state, and disables automatic
-    reconnect.
-23. `openclaw unblock-linear reconnect` makes one attempt, clears revocation only
-    on success, and returns a content-free failure otherwise.
-24. OpenClaw restart makes one connection attempt from revoked state.
-25. Device replacement fences the old enrollment, drains control-before-close,
-    and makes the reconnect command refuse it. After configuration changes, only
-    a compatible same-agent startup probe may clear the fence after authenticated
-    open and atomic replay/RPC identity rebinding.
+22. App revocation aborts work, persists revoked state, and disables automatic
+    reconnect for the same enrollment.
+23. Replacement does not disable an otherwise-active old installation/enrollment
+    until verification, then atomically activates a new same-agent enrollment
+    generation.
+24. Restart with unchanged, rolled-back, or cross-agent enrollment cannot clear
+    a revocation or replacement fence.
+25. Enrollment replacement fences the old generation and drains
+    control-before-close. Only a strictly newer same-agent generation may clear
+    a revocation or replacement fence after authenticated open; replay needs no
+    identity rewriting.
 26. A managed `media://inbound/<opaque-id>` file uploads through Linear's
     `fileUpload` flow and returns the asset URL.
 27. Paths, arbitrary URLs, malformed references, and files over 25 MiB are
@@ -926,21 +912,21 @@ prove either one.
     `Content-Length` required by Linear's signed upload destination; reject
     conflicts. File bytes never enter the WebSocket protocol.
 29. Mutation `outcome_unknown` is not automatically replayed and triggers query reconciliation.
-30. Plugin logs, channel status, doctor output, and reconnect errors contain none
+30. Plugin logs, channel status, doctor output, and connection errors contain none
     of the sensitive fields listed above.
 31. Cold and mock-runtime OpenClaw plugin inspection match the manifest.
 
-Staging validation requires an operator-provisioned enrolled device with the
+Staging validation requires an operator-provisioned enrolled agent with the
 plugin's `RelayService` and `RelayJournal`. No authenticated live staging result
 is established by the current repositories; production provisioning and release
 remain separate, explicitly authorized steps.
 
 ## Known current limits
 
-- One active device generation per logical agent.
+- One active enrollment generation per logical agent.
 - Serial delivery execution per Agent Durable Object.
 - Each authorized delivery receives a deadline 10 minutes after ingress. If it
-  remains authorized when that deadline is processed and no device socket is
+  remains authorized when that deadline is processed and no agent socket is
   connected, the Worker marks it failed and queues a user-visible Linear error
   activity instead of offering stale work later.
 - 64 KiB maximum WebSocket frame.
@@ -954,17 +940,15 @@ remain separate, explicitly authorized steps.
   many distinct sessions that never receive that control can exhaust journal
   capacity and fail closed.
 - No GraphQL subscriptions.
-- No reusable Linear OAuth credential on the OpenClaw host.
+- No reusable Linear credential or access token on the OpenClaw host.
 - Managed uploads are limited to 25 MiB and `media://inbound/<opaque-id>` sources.
 - Completed delivery-owned uploads compact with their acknowledged terminal
   delivery. Generic completed uploads outside a delivery have no trustworthy
   lifecycle endpoint and can eventually exhaust journal capacity; they are
   retained fail-closed. Pending, uploading, failed, and ambiguous upload state is
   also retained rather than guessed or evicted.
-- No device self-registration API; enrollment is operator-only through the
-  authenticated admin reservation/completion flow.
-- The current provisioning responses do not expose the assigned enrollment
-  generation, so provisioning automation must provide it separately.
+- No agent self-registration API; enrollment is operator-only through the
+  authenticated Worker `setup:agent` flow.
 - No journal backward compatibility or migration; incompatible prior state is
   rejected intentionally.
 - No exactly-once guarantee for arbitrary Linear mutations; ambiguous outcomes

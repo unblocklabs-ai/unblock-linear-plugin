@@ -30,12 +30,12 @@ describe("plugin entrypoints", () => {
 
     expect(registerChannel).toHaveBeenCalledOnce();
     expect(registerChannel).toHaveBeenCalledWith({ plugin: unblockLinearPlugin });
-    expect(registerCli).toHaveBeenCalledOnce();
+    expect(registerCli).not.toHaveBeenCalled();
     expect(getOptionalUnblockLinearRuntime()).toBe(runtime);
     clearUnblockLinearRuntime();
   });
 
-  it("loads only reconnect CLI metadata in cli-metadata mode", () => {
+  it("does not expose CLI metadata", () => {
     const registerCli = vi.fn();
     const registerChannel = vi.fn();
     const registerService = vi.fn();
@@ -49,7 +49,7 @@ describe("plugin entrypoints", () => {
       registerGatewayMethod,
     } as unknown as OpenClawPluginApi);
 
-    expect(registerCli).toHaveBeenCalledOnce();
+    expect(registerCli).not.toHaveBeenCalled();
     expect(registerChannel).not.toHaveBeenCalled();
     expect(registerService).not.toHaveBeenCalled();
     expect(registerGatewayMethod).not.toHaveBeenCalled();

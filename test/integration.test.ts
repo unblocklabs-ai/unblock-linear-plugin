@@ -32,7 +32,6 @@ const config: OpenClawConfig = {
       accountId: "default",
       origin: "https://linear-staging.unblocklabs.ai",
       agentId: "relay-agent",
-      deviceId: "relay-device",
       enrollmentGeneration: 1,
       devicePrivateKey: { source: "env", provider: "default", id: "LINEAR_DEVICE_KEY" },
     },
@@ -216,7 +215,6 @@ function inboundBase() {
   return {
     v: 1 as const,
     agentId: "relay-agent",
-    deviceId: "relay-device",
     timestamp: "2026-08-12T12:00:00.000Z",
   };
 }
@@ -246,8 +244,8 @@ describe("OpenClaw integration", () => {
     expect(registerChannel).toHaveBeenCalledOnce();
     expect(registerService).toHaveBeenCalledOnce();
     expect(registerTool).toHaveBeenCalledOnce();
-    expect(registerGatewayMethod).toHaveBeenCalledOnce();
-    expect(registerCli).toHaveBeenCalledOnce();
+    expect(registerGatewayMethod).not.toHaveBeenCalled();
+    expect(registerCli).not.toHaveBeenCalled();
     expect(typeof registerTool.mock.calls[0]?.[0]).toBe("function");
   });
 
@@ -319,10 +317,9 @@ describe("OpenClaw integration", () => {
       action: "graphql",
       document: "query { viewer { id } }",
     })).rejects.toThrow("Linear relay is unavailable");
-    await expect(registration.reconnect()).rejects.toThrow("The Unblock Linear service is unavailable");
   });
 
-  it("persists an exact stale-generation upgrade response and fences reconnect", async () => {
+  it("persists an exact stale-generation upgrade response and fences startup", async () => {
     const stateDir = await mkdtemp(join(tmpdir(), "unblock-linear-stale-generation-"));
     const socket = new FakeSocket();
     const registration = createIntegrationRegistration(apiWithRuntime(runtimeFixture()), {
@@ -331,8 +328,8 @@ describe("OpenClaw integration", () => {
     });
 
     await registration.service.start(serviceContext(stateDir));
-    socket.unexpectedResponse(409, '{"error":"device_replaced"}');
-    await waitFor(() => expect(registration.getState().statusState).toBe("device_replaced"));
+    socket.unexpectedResponse(409, '{"error":"enrollment_replaced"}');
+    await waitFor(() => expect(registration.getState().statusState).toBe("enrollment_replaced"));
     socket.close(1006, "upgrade rejected");
     await vi.waitFor(async () => {
       await expect(access(join(stateDir, "plugins", "unblock-linear", "relay-writer.lock")))
@@ -343,12 +340,10 @@ describe("OpenClaw integration", () => {
       join(stateDir, "plugins", "unblock-linear", "relay-journal.json"),
     );
     expect(journal.getLifecycle()).toEqual({
-      fence: "device_replaced",
+      fence: "enrollment_replaced",
       generation: 1,
-      enrollment: { agentId: "relay-agent", deviceId: "relay-device", enrollmentGeneration: 1 },
+      enrollment: { agentId: "relay-agent", enrollmentGeneration: 1 },
     });
-    await expect(registration.reconnect())
-      .rejects.toThrow("Update the Unblock Linear enrollment configuration");
     await registration.service.stop?.(serviceContext(stateDir));
   });
 
@@ -365,9 +360,9 @@ describe("OpenClaw integration", () => {
       ...inboundBase(),
       id: uuid(900),
       type: "control",
-      payload: { kind: "device.replaced", generation: 2 },
+      payload: { kind: "enrollment.replaced", generation: 2 },
     });
-    await waitFor(() => expect(first.getState().statusState).toBe("device_replaced"));
+    await waitFor(() => expect(first.getState().statusState).toBe("enrollment_replaced"));
     await first.service.stop?.(serviceContext(stateDir));
 
     const replacementConfig: OpenClawConfig = {
@@ -376,7 +371,6 @@ describe("OpenClaw integration", () => {
         ...config.channels,
         "unblock-linear": {
           ...config.channels?.["unblock-linear"],
-          deviceId: "relay-device-2",
           enrollmentGeneration: 2,
         },
       },
@@ -408,7 +402,7 @@ describe("OpenClaw integration", () => {
       request = sentFrames(replacementSocket).find((frame): frame is Extract<
         OutboundRelayFrame,
         { type: "rpc.request" }
-      > => frame.type === "rpc.request" && frame.deviceId === "relay-device-2");
+      > => frame.type === "rpc.request");
       expect(request).toBeDefined();
     });
     if (request === undefined) throw new Error("Expected replacement RPC request");
@@ -417,7 +411,6 @@ describe("OpenClaw integration", () => {
       id: uuid(901),
       type: "rpc.result",
       agentId: "relay-agent",
-      deviceId: "relay-device-2",
       timestamp: "2026-08-12T12:00:01.000Z",
       correlationId: request.correlationId,
       payload: { ok: true, result: { data: { viewer: { id: "me" } } } },
@@ -426,14 +419,13 @@ describe("OpenClaw integration", () => {
     await second.service.stop?.(serviceContext(stateDir, replacementConfig));
   });
 
-  it("cleans up a false relay start behind a device-replaced fence", async () => {
+  it("cleans up a false relay start behind a enrollment-replaced fence", async () => {
     const stateDir = await mkdtemp(join(tmpdir(), "unblock-linear-replaced-"));
     const pluginStateDir = join(stateDir, "plugins", "unblock-linear");
     await mkdir(pluginStateDir, { recursive: true });
     const journal = await RelayJournal.open(join(pluginStateDir, "relay-journal.json"));
-    await journal.setLifecycle("device_replaced", 2, {
+    await journal.setLifecycle("enrollment_replaced", 2, {
       agentId: "relay-agent",
-      deviceId: "relay-device",
       enrollmentGeneration: 1,
     });
     const socketFactory = vi.fn(() => new FakeSocket());
@@ -449,14 +441,13 @@ describe("OpenClaw integration", () => {
       accountId: "default",
       running: false,
       connected: false,
-      statusState: "device_replaced",
+      statusState: "enrollment_replaced",
     });
     await expect(access(join(pluginStateDir, "relay-writer.lock"))).rejects.toThrow();
     await expect(requireTool(registration).execute("replaced", {
       action: "graphql",
       document: "query { viewer { id } }",
     })).rejects.toThrow("Linear relay is unavailable");
-    await expect(registration.reconnect()).rejects.toThrow("Update the Unblock Linear enrollment configuration");
   });
 
   it("resolves guarded managed media and streams an exact redirect-blocked upload", async () => {
@@ -570,84 +561,38 @@ describe("OpenClaw integration", () => {
       .rejects.toMatchObject({ code: "not_available" });
   });
 
-  it("makes one fresh signed attempt from a persisted revoked fence", async () => {
+  it("makes one fresh signed startup probe from a persisted revoked fence", async () => {
     const stateDir = await mkdtemp(join(tmpdir(), "unblock-linear-persisted-revoked-"));
     const pluginStateDir = join(stateDir, "plugins", "unblock-linear");
     await mkdir(pluginStateDir, { recursive: true });
     const journal = await RelayJournal.open(join(pluginStateDir, "relay-journal.json"));
-    await journal.setLifecycle("revoked");
+    await journal.setLifecycle("revoked", { agentId: "relay-agent", enrollmentGeneration: 1 });
     const firstSocket = new FakeSocket();
-    const secondSocket = new FakeSocket();
-    const sockets = [firstSocket, secondSocket];
-    const socketFactory = vi.fn(() => {
-      const socket = sockets.shift();
-      if (socket === undefined) throw new Error("Unexpected reconnect attempt");
-      return socket;
-    });
+    const socketFactory = vi.fn(() => firstSocket);
+    const replacementConfig: OpenClawConfig = {
+      ...config,
+      channels: {
+        ...config.channels,
+        "unblock-linear": {
+          ...config.channels?.["unblock-linear"],
+          enrollmentGeneration: 2,
+        },
+      },
+    };
     const registration = createIntegrationRegistration(apiWithRuntime(runtimeFixture()), {
       resolveSecret: async () => JSON.stringify(PRIVATE_JWK),
       socketFactory,
     });
 
-    const startup = registration.service.start(serviceContext(stateDir));
+    const startup = registration.service.start(serviceContext(stateDir, replacementConfig));
     await waitFor(() => expect(socketFactory).toHaveBeenCalledTimes(1));
     firstSocket.close(1006, "Probe failed");
     await startup;
     expect(registration.getState().statusState).toBe("revoked");
-
-    const reconnect = registration.reconnect();
-    await waitFor(() => expect(socketFactory).toHaveBeenCalledTimes(2));
-    secondSocket.open();
-
-    await expect(reconnect).resolves.toEqual({ status: "connected" });
-    expect(registration.getState().statusState).toBe("connected");
-    expect((await RelayJournal.open(join(pluginStateDir, "relay-journal.json"))).getLifecycle())
-      .toEqual({ fence: "normal" });
-    await registration.service.stop?.(serviceContext(stateDir));
-  });
-
-  it("keeps an active failed reconnect revoked without retrying", async () => {
-    const stateDir = await mkdtemp(join(tmpdir(), "unblock-linear-active-revoked-"));
-    const firstSocket = new FakeSocket();
-    const probeSocket = new FakeSocket();
-    const sockets = [firstSocket, probeSocket];
-    const socketFactory = vi.fn(() => {
-      const socket = sockets.shift();
-      if (socket === undefined) throw new Error("Unexpected reconnect attempt");
-      return socket;
-    });
-    const registration = createIntegrationRegistration(apiWithRuntime(runtimeFixture()), {
-      resolveSecret: async () => JSON.stringify(PRIVATE_JWK),
-      socketFactory,
-    });
-    await registration.service.start(serviceContext(stateDir));
-    firstSocket.open();
-    firstSocket.message({
-      ...inboundBase(),
-      id: uuid(281),
-      type: "control",
-      payload: { kind: "installation.revoked" },
-    });
-    await waitFor(() => expect(registration.getState().statusState).toBe("revoked"));
-    await waitFor(() => expect(firstSocket.sentAtClose).toHaveLength(1));
-    await vi.waitFor(async () => {
-      await expect(access(join(stateDir, "plugins", "unblock-linear", "relay-writer.lock")))
-        .rejects.toThrow();
-    });
-
-    const reconnect = registration.reconnect();
-    await waitFor(() => expect(socketFactory).toHaveBeenCalledTimes(2));
-    probeSocket.close(1006, "Probe failed");
-
-    await expect(reconnect).rejects.toThrow("Unblock Linear remains revoked");
-    expect(registration.getState()).toMatchObject({
-      running: false,
-      connected: false,
-      statusState: "revoked",
-    });
     await new Promise((resolve) => setTimeout(resolve, 20));
-    expect(socketFactory).toHaveBeenCalledTimes(2);
-    await registration.service.stop?.(serviceContext(stateDir));
+    expect(socketFactory).toHaveBeenCalledOnce();
+    expect((await RelayJournal.open(join(pluginStateDir, "relay-journal.json"))).getLifecycle())
+      .toMatchObject({ fence: "revoked" });
   });
 
   it("compacts a delivery after its authenticated terminal acknowledgement", async () => {

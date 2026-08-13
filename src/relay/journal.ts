@@ -21,18 +21,18 @@ export const DEFAULT_JOURNAL_MAX_ENTRIES = 256;
 export const DEFAULT_JOURNAL_MAX_BYTES = 4 * 1024 * 1024;
 export const MAX_PERSISTED_RPC_BYTES = 60 * 1024;
 
-export type JournalLifecycleFence = "normal" | "revoked" | "device_replaced";
+export type JournalLifecycleFence = "normal" | "revoked" | "enrollment_replaced";
 
 export type FencedEnrollmentIdentity = {
   agentId: string;
-  deviceId: string;
   enrollmentGeneration: number;
 };
 
 export type JournalLifecycle =
-  | { fence: "normal" | "revoked" }
+  | { fence: "normal" }
+  | { fence: "revoked"; enrollment: FencedEnrollmentIdentity }
   | {
-      fence: "device_replaced";
+      fence: "enrollment_replaced";
       generation: number;
       enrollment: FencedEnrollmentIdentity;
     };
@@ -245,8 +245,8 @@ function isPositiveInteger(value: unknown): value is number {
 }
 
 function validateEnrollmentIdentity(value: unknown): value is FencedEnrollmentIdentity {
-  return isRecord(value) && hasOnlyKeys(value, ["agentId", "deviceId", "enrollmentGeneration"]) &&
-    isString(value.agentId, 128) && isString(value.deviceId, 128) &&
+  return isRecord(value) && hasOnlyKeys(value, ["agentId", "enrollmentGeneration"]) &&
+    isString(value.agentId, 128) &&
     isPositiveInteger(value.enrollmentGeneration);
 }
 
@@ -402,7 +402,6 @@ function validateRpcInvocation(value: unknown): value is RpcInvocationRecord {
   return value.result === undefined ||
     (value.result.correlationId === value.request.correlationId &&
       value.result.agentId === value.request.agentId &&
-      value.result.deviceId === value.request.deviceId &&
       value.result.sessionId === value.request.sessionId);
 }
 
@@ -421,10 +420,13 @@ function validateUpload(value: unknown): value is UploadWorkflow {
 function validateState(value: unknown): value is JournalState {
   if (!isRecord(value) || value.version !== 1 || !isRecord(value.lifecycle) ||
     !hasOnlyKeys(value.lifecycle, ["fence", "generation", "enrollment"]) ||
-    (value.lifecycle.fence !== "normal" && value.lifecycle.fence !== "revoked" && value.lifecycle.fence !== "device_replaced") ||
-    (value.lifecycle.fence === "device_replaced"
-      ? (!isPositiveInteger(value.lifecycle.generation) || !validateEnrollmentIdentity(value.lifecycle.enrollment))
-      : (value.lifecycle.generation !== undefined || value.lifecycle.enrollment !== undefined)) ||
+    (value.lifecycle.fence !== "normal" && value.lifecycle.fence !== "revoked" && value.lifecycle.fence !== "enrollment_replaced") ||
+    (value.lifecycle.fence === "normal"
+      ? (value.lifecycle.generation !== undefined || value.lifecycle.enrollment !== undefined)
+      : (!validateEnrollmentIdentity(value.lifecycle.enrollment) ||
+        (value.lifecycle.fence === "enrollment_replaced"
+          ? !isPositiveInteger(value.lifecycle.generation)
+          : value.lifecycle.generation !== undefined))) ||
     !isPositiveInteger(value.nextSequence) ||
     !isRecord(value.stoppedSessions) || !isRecord(value.bindings) || !isRecord(value.deliveries) || !Array.isArray(value.replay) ||
     !isRecord(value.rpcInvocations) || !isRecord(value.uploads)) return false;
@@ -661,36 +663,39 @@ export class RelayJournal {
   }
 
   setLifecycle(...input:
-    | [fence: Exclude<JournalLifecycleFence, "device_replaced">]
-    | [fence: "device_replaced", generation: number, enrollment: FencedEnrollmentIdentity]
+    | [fence: "normal"]
+    | [fence: "revoked", enrollment: FencedEnrollmentIdentity]
+    | [fence: "enrollment_replaced", generation: number, enrollment: FencedEnrollmentIdentity]
   ): Promise<void> {
     return this.mutate((state) => {
-      state.lifecycle = input[0] === "device_replaced"
-        ? { fence: input[0], generation: input[1], enrollment: input[2] }
-        : { fence: input[0] };
+      state.lifecycle = input[0] === "normal"
+        ? { fence: input[0] }
+        : input[0] === "revoked"
+          ? { fence: input[0], enrollment: input[1] }
+          : { fence: input[0], generation: input[1], enrollment: input[2] };
     });
   }
 
   activateReplacement(enrollment: FencedEnrollmentIdentity): Promise<void> {
     return this.mutate((state) => {
       const lifecycle = state.lifecycle;
-      if (lifecycle.fence !== "device_replaced" || enrollment.enrollmentGeneration < lifecycle.generation ||
+      if (lifecycle.fence === "normal" ||
         lifecycle.enrollment.agentId !== enrollment.agentId ||
-        isDeepStrictEqual(lifecycle.enrollment, enrollment)) {
+        enrollment.enrollmentGeneration <= lifecycle.enrollment.enrollmentGeneration ||
+        (lifecycle.fence === "enrollment_replaced" && enrollment.enrollmentGeneration < lifecycle.generation)) {
         throw new JournalError("Journal state failed validation");
       }
 
-      const rebindFrame = <T extends RelayFrame | RpcResultFrame>(frame: T): T => {
+      const validateFrameAgent = (frame: RelayFrame | RpcResultFrame): void => {
         if (frame.agentId !== enrollment.agentId) {
           throw new JournalError("Journal state failed validation");
         }
-        return { ...frame, deviceId: enrollment.deviceId };
       };
 
-      for (const entry of state.replay) entry.frame = rebindFrame(entry.frame);
+      for (const entry of state.replay) validateFrameAgent(entry.frame);
       for (const invocation of Object.values(state.rpcInvocations)) {
-        invocation.request = rebindFrame(invocation.request);
-        if (invocation.result !== undefined) invocation.result = rebindFrame(invocation.result);
+        validateFrameAgent(invocation.request);
+        if (invocation.result !== undefined) validateFrameAgent(invocation.result);
       }
       state.lifecycle = { fence: "normal" };
     });
@@ -811,7 +816,6 @@ export class RelayJournal {
       if (matches.length !== 1) throw new JournalError("Journal state failed validation");
       const invocation = matches[0];
       if (result.agentId !== invocation.request.agentId ||
-        result.deviceId !== invocation.request.deviceId ||
         result.sessionId !== invocation.request.sessionId) {
         throw new JournalError("Journal state failed validation");
       }

@@ -52,13 +52,12 @@ export type LinearRpcResult = Extract<InboundRelayFrame, { type: "rpc.result" }>
 
 export type RelayIdentity = {
   agentId: string;
-  deviceId: string;
 };
 
 /**
  * The relay service implements this small durability boundary. It must retain
  * the exact persisted request until consumeResult succeeds. Reconnect and any
- * retryable resend use the same complete request, including both identities.
+ * retryable resend use the same complete request, including its relay identity.
  */
 export interface DurableRpcPort {
   getRelayIdentity(): RelayIdentity;
@@ -214,7 +213,6 @@ function createGraphqlRequest(
     id: identity.uuid(),
     type: "rpc.request",
     agentId: relayIdentity.agentId,
-    deviceId: relayIdentity.deviceId,
     timestamp: identity.now(),
     ...(runBinding === undefined ? {} : { sessionId: runBinding.linearSessionId }),
     correlationId: identity.uuid(),
@@ -303,7 +301,7 @@ function mapRpcFailure(error: Extract<LinearRpcResult["payload"], { ok: false }>
   if (error.code === "unauthorized") {
     throw new LinearToolError(
       "unauthorized",
-      "Linear authorization is unavailable. Reauthorize and reconnect the plugin.",
+      "This Linear request is no longer authorized.",
     );
   }
   if (error.code === "outcome_unknown") {

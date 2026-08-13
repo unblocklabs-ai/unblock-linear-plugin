@@ -14,6 +14,7 @@ import {
 import {
   type FencedEnrollmentIdentity,
   type JournalLifecycle,
+  type JournalLifecycleFence,
   type RelayJournal,
   type ReplayEntry,
   type ReplayEntryInput,
@@ -25,7 +26,7 @@ export type RelayServiceState =
   | "connected"
   | "reconnect_wait"
   | "revoked"
-  | "device_replaced"
+  | "enrollment_replaced"
   | "stopped";
 
 export type RelaySocket = {
@@ -62,8 +63,8 @@ export type RelayServiceCallbacks = {
   onSessionStop?(sessionId: string | undefined, reason: string | undefined): Promise<void> | void;
   onTeamAccessRemoved?(teamId: string): Promise<void> | void;
   onInstallationRevoked?(): Promise<void> | void;
-  onDeviceReplaced?(generation: number): Promise<void> | void;
-  onTerminal?(reason: "revoked" | "device_replaced"): Promise<void> | void;
+  onEnrollmentReplaced?(generation: number): Promise<void> | void;
+  onTerminal?(reason: "revoked" | "enrollment_replaced"): Promise<void> | void;
   onStateChange?(state: RelayServiceState): void;
 };
 
@@ -118,8 +119,7 @@ export class RelayService {
   private reconnectTimer: unknown;
   private reconnectAttempt = 0;
   private oneShot = false;
-  private probingRevoked = false;
-  private probingReplacement = false;
+  private probingFence: Exclude<JournalLifecycleFence, "normal"> | undefined;
   private replacementActivation: Promise<void> | undefined;
   private inbound = Promise.resolve();
   private closeWaiter: Promise<void> | undefined;
@@ -152,17 +152,16 @@ export class RelayService {
   async start(startOptions: RelayStartOptions = {}): Promise<boolean> {
     if (this.state !== "stopped") return false;
     const fence = this.options.journal.getLifecycle();
-    const probingReplacement = fence.fence === "device_replaced" &&
-      replacementProbeAllowed(fence, this.enrollmentIdentity());
-    if (fence.fence === "device_replaced" && !probingReplacement) {
-      this.setState("device_replaced");
+    const probingFence = fence.fence !== "normal" && replacementProbeAllowed(fence, this.enrollmentIdentity())
+      ? fence.fence
+      : undefined;
+    if (fence.fence !== "normal" && probingFence === undefined) {
+      this.setState(fence.fence);
       return false;
     }
 
     this.oneShot = startOptions.oneShot === true;
-    const probingRevoked = fence.fence === "revoked";
-    this.probingRevoked = probingRevoked;
-    this.probingReplacement = probingReplacement;
+    this.probingFence = probingFence;
     this.setState("starting");
     try {
       this.lease = await this.acquireLease(this.options.leasePath);
@@ -172,40 +171,34 @@ export class RelayService {
     }
     const opening = this.connect();
     if (opening === undefined) {
-      if (probingRevoked) {
-        this.setState("revoked");
-        await this.releaseLease();
-      } else if (probingReplacement) {
-        this.setState("device_replaced");
+      if (probingFence !== undefined) {
+        this.setState(probingFence);
         await this.releaseLease();
       } else if (this.oneShot) {
         await this.releaseLeaseAndStop();
       }
-      return !probingRevoked && !this.oneShot && this.getState() === "reconnect_wait";
+      return probingFence === undefined && !this.oneShot && this.getState() === "reconnect_wait";
     }
-    if (!probingRevoked && !probingReplacement && startOptions.awaitOpen !== true) return true;
+    if (probingFence === undefined && startOptions.awaitOpen !== true) return true;
 
     const opened = await opening;
     if (!opened) {
-      if (probingRevoked && this.getState() !== "device_replaced") {
-        this.setState("revoked");
-        await this.releaseLease();
-      } else if (probingReplacement && this.getState() !== "device_replaced") {
-        this.setState("device_replaced");
+      if (probingFence !== undefined && this.getState() !== "enrollment_replaced") {
+        this.setState(probingFence);
         await this.releaseLease();
       }
       return false;
     }
-    if (probingReplacement) {
+    if (probingFence !== undefined) {
       const activation = this.replacementActivation;
       if (activation === undefined) return false;
       try {
         await activation;
       } catch {
-        await this.failReplacementProbe();
+        await this.failFencedProbe();
         return false;
       }
-      this.finishReplacementProbe();
+      this.finishFencedProbe();
       if (this.socket !== undefined && this.getState() === "connected") {
         await this.replayUnresolved();
       } else if (this.getState() === "connected") {
@@ -213,12 +206,7 @@ export class RelayService {
       }
       return this.getState() === "connected" || this.getState() === "reconnect_wait";
     }
-    if (!probingRevoked) return true;
-    if (this.getState() !== "connected" || !this.probingRevoked) return false;
-    await this.options.journal.setLifecycle("normal");
-    this.probingRevoked = false;
-    await this.replayUnresolved();
-    return this.getState() === "connected";
+    return true;
   }
 
   async stop(): Promise<void> {
@@ -240,7 +228,7 @@ export class RelayService {
   }
 
   async send(frame: OutboundRelayFrame): Promise<void> {
-    if (this.state === "revoked" || this.state === "device_replaced") throw new RelayServiceError("terminal");
+    if (this.state === "revoked" || this.state === "enrollment_replaced") throw new RelayServiceError("terminal");
     if (this.state === "stopped") throw new RelayServiceError("stopped");
     const encoded = JSON.stringify(frame);
     const validated = parseOutboundRelayFrame(encoded);
@@ -268,21 +256,21 @@ export class RelayService {
   }
 
   private async persistAndSend(entry: ReplayEntryInput): Promise<boolean> {
-    if (this.state === "revoked" || this.state === "device_replaced") throw new RelayServiceError("terminal");
+    if (this.state === "revoked" || this.state === "enrollment_replaced") throw new RelayServiceError("terminal");
     if (this.state === "stopped") throw new RelayServiceError("stopped");
     const persisted = await this.options.journal.addReplay(entry);
     return this.sendEncoded(JSON.stringify(persisted.frame));
   }
 
   private connect(): Promise<boolean> | undefined {
-    if (this.socket !== undefined || this.state === "revoked" || this.state === "device_replaced" || this.state === "stopped") {
+    if (this.socket !== undefined || this.state === "revoked" || this.state === "enrollment_replaced" || this.state === "stopped") {
       return undefined;
     }
     let socket: RelaySocket;
     try {
       socket = this.options.socketFactory(createSignedDeviceUpgrade(this.options.account, this.options.auth));
     } catch {
-      if (!this.probingRevoked && !this.probingReplacement) this.scheduleReconnect();
+      if (this.probingFence === undefined) this.scheduleReconnect();
       return undefined;
     }
     this.socket = socket;
@@ -313,20 +301,20 @@ export class RelayService {
     response: RelayUnexpectedResponse,
   ): Promise<void> {
     if (socket !== this.socket || this.isTerminalOrStopped()) return;
-    if (response.statusCode === 409 && isDeviceReplacedResponse(response.body)) {
-      await this.transitionTerminal("device_replaced", this.options.account.enrollmentGeneration);
+    if (response.statusCode === 409 && isEnrollmentReplacedResponse(response.body)) {
+      await this.transitionTerminal("enrollment_replaced", this.options.account.enrollmentGeneration);
     }
   }
 
   private async handleOpen(socket: RelaySocket): Promise<void> {
     if (socket !== this.socket || this.isTerminalOrStopped()) return;
     this.reconnectAttempt = 0;
-    if (this.probingReplacement) {
+    if (this.probingFence !== undefined) {
       this.replacementActivation = this.options.journal.activateReplacement(this.enrollmentIdentity());
     }
     this.setState("connected");
     this.settleOpening(socket, true);
-    if (!this.probingRevoked && !this.probingReplacement) await this.replayUnresolved();
+    if (this.probingFence === undefined) await this.replayUnresolved();
   }
 
   private enqueueInbound(socket: RelaySocket, data: string | ArrayBuffer): void {
@@ -347,11 +335,10 @@ export class RelayService {
       socket.close(error instanceof RelayProtocolError && error.code === "frame_too_large" ? 1009 : 1008, "Invalid relay frame");
       return;
     }
-    const replacement = isNewerDeviceReplacement(frame, this.options.account);
+    const replacement = isNewerEnrollmentReplacement(frame, this.options.account);
     if (
       frame.agentId !== this.options.account.agentId ||
-      (frame.type === "control" && frame.payload.kind === "device.replaced" && !replacement) ||
-      (frame.deviceId !== this.options.account.deviceId && !replacement)
+      (frame.type === "control" && frame.payload.kind === "enrollment.replaced" && !replacement)
     ) {
       socket.close(1008, "Relay identity mismatch");
       return;
@@ -414,10 +401,10 @@ export class RelayService {
         await this.transitionTerminal("revoked");
         socket.close(4003, "Installation revoked");
         return;
-      case "device.replaced": {
+      case "enrollment.replaced": {
         const generation = frame.payload.generation;
-        await this.transitionTerminal("device_replaced", generation);
-        socket.close(4001, "Device replaced");
+        await this.transitionTerminal("enrollment_replaced", generation);
+        socket.close(4001, "Enrollment replaced");
         return;
       }
     }
@@ -431,7 +418,7 @@ export class RelayService {
     this.closeWaiter = undefined;
     try {
       if (this.state === "stopped") return;
-      if (this.state === "revoked" || this.state === "device_replaced") {
+      if (this.state === "revoked" || this.state === "enrollment_replaced") {
         await this.releaseLease();
         return;
       }
@@ -440,24 +427,19 @@ export class RelayService {
         await this.releaseLease();
         return;
       }
-      if (this.probingRevoked) {
-        this.setState("revoked");
-        await this.releaseLease();
-        return;
-      }
-      if (this.probingReplacement) {
+      if (this.probingFence !== undefined) {
         const activation = this.replacementActivation;
         if (activation === undefined) {
-          await this.failReplacementProbe();
+          await this.failFencedProbe();
           return;
         }
         try {
           await activation;
         } catch {
-          await this.failReplacementProbe();
+          await this.failFencedProbe();
           return;
         }
-        this.finishReplacementProbe();
+        this.finishFencedProbe();
         if (this.oneShot) {
           await this.releaseLeaseAndStop();
           return;
@@ -509,7 +491,7 @@ export class RelayService {
   }
 
   private isTerminalOrStopped(): boolean {
-    return this.state === "stopped" || this.state === "revoked" || this.state === "device_replaced";
+    return this.state === "stopped" || this.state === "revoked" || this.state === "enrollment_replaced";
   }
 
   private setState(state: RelayServiceState): void {
@@ -610,67 +592,65 @@ export class RelayService {
   }
 
   private async transitionTerminal(
-    ...[reason, generation]: [reason: "revoked"] | [reason: "device_replaced", generation: number]
+    ...[reason, generation]: [reason: "revoked"] | [reason: "enrollment_replaced", generation: number]
   ): Promise<void> {
-    if (reason === "device_replaced") {
+    if (reason === "enrollment_replaced") {
       await this.options.journal.setLifecycle(
         reason,
         generation,
         this.enrollmentIdentity(),
       );
     } else {
-      await this.options.journal.setLifecycle(reason);
+      await this.options.journal.setLifecycle(reason, this.enrollmentIdentity());
     }
-    this.probingRevoked = false;
-    this.probingReplacement = false;
+    this.probingFence = undefined;
     this.setState(reason);
     if (reason === "revoked") {
       await this.callbacks.onInstallationRevoked?.();
     } else {
-      await this.callbacks.onDeviceReplaced?.(generation);
+      await this.callbacks.onEnrollmentReplaced?.(generation);
     }
     await this.callbacks.onTerminal?.(reason);
   }
 
-  private finishReplacementProbe(): void {
-    this.probingReplacement = false;
+  private finishFencedProbe(): void {
+    this.probingFence = undefined;
     this.replacementActivation = undefined;
   }
 
-  private async failReplacementProbe(): Promise<void> {
-    this.finishReplacementProbe();
-    this.setState("device_replaced");
-    this.socket?.close(1011, "Replacement activation failed");
+  private async failFencedProbe(): Promise<void> {
+    const fence = this.options.journal.getLifecycle().fence;
+    this.finishFencedProbe();
+    this.setState(fence === "normal" ? "stopped" : fence);
+    this.socket?.close(1011, "Enrollment activation failed");
     await this.releaseLease();
   }
 
   private enrollmentIdentity(): FencedEnrollmentIdentity {
     return {
       agentId: this.options.account.agentId,
-      deviceId: this.options.account.deviceId,
       enrollmentGeneration: this.options.account.enrollmentGeneration,
     };
   }
 }
 
 function replacementProbeAllowed(
-  lifecycle: Extract<JournalLifecycle, { fence: "device_replaced" }>,
+  lifecycle: Exclude<JournalLifecycle, { fence: "normal" }>,
   configured: FencedEnrollmentIdentity,
 ): boolean {
-  if (configured.enrollmentGeneration < lifecycle.generation) return false;
   return lifecycle.enrollment.agentId === configured.agentId &&
-    (lifecycle.enrollment.deviceId !== configured.deviceId ||
-      lifecycle.enrollment.enrollmentGeneration !== configured.enrollmentGeneration);
+    configured.enrollmentGeneration > lifecycle.enrollment.enrollmentGeneration &&
+    (lifecycle.fence !== "enrollment_replaced" || configured.enrollmentGeneration >= lifecycle.generation);
 }
 
-function isNewerDeviceReplacement(
+function isNewerEnrollmentReplacement(
   frame: InboundRelayFrame,
   account: DeviceAuthUpgradeInput,
 ): frame is Extract<InboundRelayFrame, { type: "control" }> & {
-  payload: { kind: "device.replaced"; generation: number };
+  payload: { kind: "enrollment.replaced"; generation: number };
 } {
   return frame.type === "control" &&
-    frame.payload.kind === "device.replaced" &&
+    frame.payload.kind === "enrollment.replaced" &&
     frame.agentId === account.agentId &&
     frame.payload.generation > account.enrollmentGeneration;
 }
@@ -682,7 +662,7 @@ function isTerminalDeliveryAcknowledgement(
     frame.payload.status === "canceled";
 }
 
-function isDeviceReplacedResponse(body: string | undefined): boolean {
+function isEnrollmentReplacedResponse(body: string | undefined): boolean {
   if (body === undefined) return false;
   let value: unknown;
   try {
@@ -693,5 +673,5 @@ function isDeviceReplacedResponse(body: string | undefined): boolean {
   if (typeof value !== "object" || value === null || Array.isArray(value)) return false;
   const entries = Object.entries(value);
   return entries.length === 1 && entries[0]?.[0] === "error" &&
-    entries[0][1] === "device_replaced";
+    entries[0][1] === "enrollment_replaced";
 }

@@ -7,7 +7,6 @@ const configured = {
     "unblock-linear": {
       origin: "https://linear-staging.unblocklabs.ai",
       agentId: "relay-agent",
-      deviceId: "relay-device",
       enrollmentGeneration: 1,
       devicePrivateKey: {
         source: "env",
@@ -35,7 +34,7 @@ describe("Unblock Linear channel", () => {
     ["connected", true, "ready", false],
     ["reconnect_wait", false, "recovering", false],
     ["revoked", false, "blocked", true],
-    ["device_replaced", false, "blocked", true],
+    ["enrollment_replaced", false, "blocked", true],
   ] as const)(
     "builds a distinct, content-free %s status snapshot",
     async (relayState, connected, lifecycle, terminalDisconnect) => {
@@ -86,7 +85,6 @@ describe("Unblock Linear channel", () => {
 
     expect(warnings).toEqual([
       "channels.unblock-linear account default is missing or has invalid origin.",
-      "channels.unblock-linear account default is missing or has invalid deviceId.",
       "channels.unblock-linear account default is missing or has invalid enrollmentGeneration.",
       "channels.unblock-linear account default is missing or has invalid devicePrivateKey.",
     ]);

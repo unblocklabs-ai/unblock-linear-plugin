@@ -23,7 +23,6 @@ export type ResolvedUnblockLinearAccount = {
   origin?: UnblockLinearOrigin;
   /** Worker relay identity. OpenClaw agent selection remains channel-binding owned. */
   relayAgentId?: string;
-  deviceId?: string;
   enrollmentGeneration?: number;
   devicePrivateKey?: SecretRef;
   configurationIssues: string[];
@@ -60,7 +59,6 @@ export const unblockLinearChannelConfigSchema = {
         description:
           "Worker relay identity only; OpenClaw agent routing uses normal channel bindings.",
       },
-      deviceId: relayIdSchema,
       enrollmentGeneration: { type: "integer", minimum: 1 },
       devicePrivateKey: {
         type: "object",
@@ -146,9 +144,6 @@ function collectConfigurationIssues(
   if (!readRelayId(raw.agentId)) {
     issues.push("agentId");
   }
-  if (!readRelayId(raw.deviceId)) {
-    issues.push("deviceId");
-  }
   if (!readEnrollmentGeneration(raw.enrollmentGeneration)) {
     issues.push("enrollmentGeneration");
   }
@@ -184,7 +179,6 @@ export function resolveUnblockLinearAccount(
     configured: configurationIssues.length === 0,
     origin: readOrigin(raw.origin),
     relayAgentId: readRelayId(raw.agentId),
-    deviceId: readRelayId(raw.deviceId),
     enrollmentGeneration: readEnrollmentGeneration(raw.enrollmentGeneration),
     devicePrivateKey: readDevicePrivateKey(cfg, raw.devicePrivateKey),
     configurationIssues,

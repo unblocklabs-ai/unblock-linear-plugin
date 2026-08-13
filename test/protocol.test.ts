@@ -59,6 +59,15 @@ describe("relay protocol v1", () => {
     }
   });
 
+  it("rejects the legacy deviceId envelope field instead of stripping it", async () => {
+    const invalid = await fixture("invalid-frames.json") as Array<{ name: string; frame: unknown }>;
+    const legacy = invalid.find((item) => item.name.startsWith("legacy deviceId"));
+    if (legacy === undefined) throw new Error("Expected legacy deviceId parity fixture");
+
+    expect(relayFrameSchema.safeParse(legacy.frame).success).toBe(false);
+    expect(protocolError(() => parseRelayFrame(JSON.stringify(legacy.frame))).code).toBe("invalid_frame");
+  });
+
   it("accepts only Worker-to-plugin frame families on the inbound path", async () => {
     const inbound = await fixture("valid-inbound.json") as unknown[];
     const outbound = await fixture("valid-outbound.json") as unknown[];

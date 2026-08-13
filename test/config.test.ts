@@ -12,7 +12,6 @@ import {
 const enrolledDevice = {
   origin: "https://linear-staging.unblocklabs.ai",
   agentId: "worker-relay-agent",
-  deviceId: "device_1",
   enrollmentGeneration: 3,
   devicePrivateKey: {
     source: "env",
@@ -64,7 +63,6 @@ describe("Unblock Linear account config", () => {
         "unblock-linear": {
           origin: "https://example.com",
           agentId: "invalid relay id",
-          deviceId: "",
           enrollmentGeneration: 0,
           devicePrivateKey: privateKey,
         },
@@ -78,14 +76,12 @@ describe("Unblock Linear account config", () => {
     expect(account.configurationIssues).toEqual([
       "origin",
       "agentId",
-      "deviceId",
       "enrollmentGeneration",
       "devicePrivateKey",
     ]);
     expect(JSON.stringify(inspection)).not.toContain(privateKey);
     expect(inspection).not.toHaveProperty("origin");
     expect(inspection).not.toHaveProperty("relayAgentId");
-    expect(inspection).not.toHaveProperty("deviceId");
   });
 
   it("writes one enrollment at the channel root", () => {
@@ -117,7 +113,6 @@ describe("Unblock Linear account config", () => {
     const base = {
       origin: enrolledDevice.origin,
       agentId: enrolledDevice.agentId,
-      deviceId: enrolledDevice.deviceId,
       enrollmentGeneration: enrolledDevice.enrollmentGeneration,
     };
     const resolveKey = (devicePrivateKey: unknown, secrets?: OpenClawConfig["secrets"]) =>

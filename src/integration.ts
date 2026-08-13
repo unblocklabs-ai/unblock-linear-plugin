@@ -35,10 +35,6 @@ import {
   type RelaySocket,
   type RelaySocketFactory,
 } from "./relay/service.js";
-import {
-  ReconnectError,
-  type ReconnectResult,
-} from "./reconnect.js";
 
 const SERVICE_ID = "unblock-linear-relay";
 const SECRET_PATH = "channels.unblock-linear.devicePrivateKey";
@@ -48,7 +44,6 @@ type ConfiguredAccount = ResolvedUnblockLinearAccount & Required<Pick<
   ResolvedUnblockLinearAccount,
   | "origin"
   | "relayAgentId"
-  | "deviceId"
   | "enrollmentGeneration"
   | "devicePrivateKey"
 >>;
@@ -72,7 +67,6 @@ export type IntegrationRegistration = Readonly<{
   service: Parameters<OpenClawPluginApi["registerService"]>[0];
   toolFactory: ReturnType<typeof createLinearToolFactory>;
   getState(): IntegrationState;
-  reconnect(): Promise<ReconnectResult>;
 }>;
 
 type ActiveIntegration = {
@@ -177,8 +171,6 @@ export function createIntegrationRegistration(
   const resolveSecret = dependencies.resolveSecret ?? resolveRequiredConfiguredSecretRefInputString;
   const socketFactory = dependencies.socketFactory ?? createWebSocketRelaySocket;
   let active: ActiveIntegration | undefined;
-  let serviceContext: Parameters<IntegrationRegistration["service"]["start"]>[0] | undefined;
-  let reconnecting: Promise<ReconnectResult> | undefined;
   let state: IntegrationState = {
     running: false,
     connected: false,
@@ -189,7 +181,7 @@ export function createIntegrationRegistration(
     state = {
       ...(accountId === undefined ? {} : { accountId }),
       running: statusState !== "stopped" && statusState !== "revoked" &&
-        statusState !== "device_replaced",
+        statusState !== "enrollment_replaced",
       connected: statusState === "connected",
       statusState,
     };
@@ -198,7 +190,6 @@ export function createIntegrationRegistration(
   const service: Parameters<OpenClawPluginApi["registerService"]>[0] = {
     id: SERVICE_ID,
     async start(ctx): Promise<void> {
-      serviceContext = ctx;
       if (active !== undefined) return;
       const account = requireConfiguredAccount(resolveUnblockLinearAccount(ctx.config));
       const serializedPrivateKey = await resolveSecret({
@@ -227,7 +218,6 @@ export function createIntegrationRegistration(
         account: {
           origin: account.origin,
           agentId: account.relayAgentId,
-          deviceId: account.deviceId,
           enrollmentGeneration: account.enrollmentGeneration,
           privateKeyJwk,
         },
@@ -254,15 +244,15 @@ export function createIntegrationRegistration(
           async onInstallationRevoked(): Promise<void> {
             await rpc?.rejectTerminal("revoked");
           },
-          async onDeviceReplaced(): Promise<void> {
-            await rpc?.rejectTerminal("device_replaced");
+          async onEnrollmentReplaced(): Promise<void> {
+            await rpc?.rejectTerminal("enrollment_replaced");
           },
           async onTerminal(): Promise<void> {
             await executor?.abortAllAndWaitOffline();
           },
           onStateChange(statusState): void {
             updateState(statusState, account.accountId);
-            if ((statusState === "revoked" || statusState === "device_replaced") && rpc !== undefined) {
+            if ((statusState === "revoked" || statusState === "enrollment_replaced") && rpc !== undefined) {
               durableRpc.clear(rpc);
               if (active !== undefined) managedUpload.clear(active.upload);
             }
@@ -271,7 +261,7 @@ export function createIntegrationRegistration(
       });
       rpc = new RpcBridge({
         journal,
-        relayIdentity: { agentId: account.relayAgentId, deviceId: account.deviceId },
+        relayIdentity: { agentId: account.relayAgentId },
         async sendPersisted(request): Promise<boolean> {
           try {
             await relay.send(request);
@@ -286,7 +276,7 @@ export function createIntegrationRegistration(
         runtime: api.runtime,
         config: ctx.config,
         accountId: account.accountId,
-        relayIdentity: { agentId: account.relayAgentId, deviceId: account.deviceId },
+        relayIdentity: { agentId: account.relayAgentId },
         relay,
         journal,
       });
@@ -308,7 +298,7 @@ export function createIntegrationRegistration(
           managedUpload.clear(upload);
           if (active === started) active = undefined;
           updateState(
-            terminalState === "revoked" || terminalState === "device_replaced"
+            terminalState === "revoked" || terminalState === "enrollment_replaced"
               ? terminalState
               : "stopped",
             account.accountId,
@@ -323,7 +313,7 @@ export function createIntegrationRegistration(
           managedUpload.clear(upload);
           if (active === started) active = undefined;
           updateState(
-            lifecycle === "revoked" || lifecycle === "device_replaced" ? lifecycle : "stopped",
+            lifecycle === "revoked" || lifecycle === "enrollment_replaced" ? lifecycle : "stopped",
             account.accountId,
           );
         }
@@ -331,7 +321,6 @@ export function createIntegrationRegistration(
       }
     },
     async stop(): Promise<void> {
-      serviceContext = undefined;
       const current = active;
       if (current === undefined) {
         updateState("stopped", state.accountId);
@@ -353,88 +342,10 @@ export function createIntegrationRegistration(
     },
   };
 
-  const reconnect = (): Promise<ReconnectResult> => {
-    if (reconnecting !== undefined) {
-      throw new ReconnectError("failed", "An Unblock Linear reconnect attempt is already running");
-    }
-    const attempt = reconnectOnce();
-    reconnecting = attempt;
-    void attempt.finally(() => {
-      if (reconnecting === attempt) reconnecting = undefined;
-    }).catch(() => undefined);
-    return attempt;
-  };
-
-  const reconnectOnce = async (): Promise<ReconnectResult> => {
-    const current = active;
-    if (current !== undefined) {
-      const relayState = current.relay.getState();
-      if (relayState === "device_replaced") throw deviceReplacedError();
-      if (relayState !== "revoked") {
-        throw new ReconnectError("not_revoked", "Unblock Linear is not revoked");
-      }
-
-      try {
-        await current.relay.stop();
-        const didStart = await current.relay.start();
-        if (!didStart || current.relay.getState() !== "connected") {
-          updateState("revoked", state.accountId);
-          throw new ReconnectError("failed", "Unblock Linear remains revoked");
-        }
-      } catch (error) {
-        if (current.journal.getLifecycle().fence === "device_replaced") {
-          updateState("device_replaced", state.accountId);
-          throw deviceReplacedError();
-        }
-        updateState("revoked", state.accountId);
-        if (error instanceof ReconnectError) throw error;
-        throw new ReconnectError("failed", "Unblock Linear remains revoked");
-      }
-      durableRpc.set(current.rpc);
-      managedUpload.set(current.upload);
-      return { status: "connected" };
-    }
-
-    const ctx = serviceContext;
-    if (ctx === undefined) {
-      throw new ReconnectError("unavailable", "The Unblock Linear service is unavailable");
-    }
-    const journal = await openRelayJournal(ctx.stateDir);
-    const lifecycle = journal.getLifecycle();
-    if (lifecycle.fence === "device_replaced") {
-      updateState("device_replaced", state.accountId);
-      throw deviceReplacedError();
-    }
-    if (lifecycle.fence !== "revoked") {
-      throw new ReconnectError("not_revoked", "Unblock Linear is not revoked");
-    }
-
-    try {
-      await service.start(ctx);
-    } catch {
-      if ((await openRelayJournal(ctx.stateDir)).getLifecycle().fence === "device_replaced") {
-        updateState("device_replaced", state.accountId);
-        throw deviceReplacedError();
-      }
-      updateState("revoked", state.accountId);
-      throw new ReconnectError("failed", "Unblock Linear remains revoked");
-    }
-    if (active === undefined || active.relay.getState() !== "connected") {
-      if ((await openRelayJournal(ctx.stateDir)).getLifecycle().fence === "device_replaced") {
-        updateState("device_replaced", state.accountId);
-        throw deviceReplacedError();
-      }
-      updateState("revoked", state.accountId);
-      throw new ReconnectError("failed", "Unblock Linear remains revoked");
-    }
-    return { status: "connected" };
-  };
-
   return {
     service,
     toolFactory: createLinearToolFactory({ rpc: durableRpc, upload: managedUpload }),
     getState: () => ({ ...state }),
-    reconnect,
   };
 }
 
@@ -489,23 +400,10 @@ function safeMediaBasename(filePath: string): string | undefined {
     : undefined;
 }
 
-function deviceReplacedError(): ReconnectError {
-  return new ReconnectError(
-    "device_replaced",
-    "Update the Unblock Linear enrollment configuration before reconnecting",
-  );
-}
-
-async function openRelayJournal(stateDir: string): Promise<RelayJournal> {
-  const pluginStateDir = join(stateDir, STATE_SUBDIRECTORY);
-  await mkdir(pluginStateDir, { recursive: true, mode: 0o700 });
-  return RelayJournal.open(join(pluginStateDir, "relay-journal.json"));
-}
-
 function requireConfiguredAccount(account: ResolvedUnblockLinearAccount): ConfiguredAccount {
   if (!account.enabled) throw new Error("Unblock Linear account is disabled");
   if (!account.configured || account.origin === undefined || account.relayAgentId === undefined ||
-    account.deviceId === undefined || account.enrollmentGeneration === undefined ||
+    account.enrollmentGeneration === undefined ||
     account.devicePrivateKey === undefined) {
     throw new Error("Unblock Linear account is not configured");
   }
@@ -513,7 +411,6 @@ function requireConfiguredAccount(account: ResolvedUnblockLinearAccount): Config
     ...account,
     origin: account.origin,
     relayAgentId: account.relayAgentId,
-    deviceId: account.deviceId,
     enrollmentGeneration: account.enrollmentGeneration,
     devicePrivateKey: account.devicePrivateKey,
   };

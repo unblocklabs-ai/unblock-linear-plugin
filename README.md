@@ -1,6 +1,6 @@
 # Unblock Linear for OpenClaw
 
-An OpenClaw channel plugin that connects an enrolled OpenClaw device to the
+An OpenClaw channel plugin that connects an enrolled OpenClaw agent to the
 Unblock Linear relay. Linear AgentSession work is delivered to OpenClaw, and
 the agent receives one `linear` tool for bounded GraphQL requests and approved
 media uploads.
@@ -9,9 +9,9 @@ media uploads.
 
 - OpenClaw **2026.7.2-beta.7 or newer**
 - Node.js 22 or newer
-- An enrolled P-256 device and its private JWK stored through an OpenClaw
+- An enrolled P-256 agent key and its private JWK stored through an OpenClaw
   `SecretRef`
-- A completed Unblock Linear installation and OAuth authorization
+- An active Unblock Linear private app provisioned through the Worker setup CLI
 
 The production relay is:
 
@@ -50,7 +50,7 @@ openclaw plugins enable unblock-linear
 Do not install both forms at the same time. The linked checkout is the
 development path; the package install is the release path.
 
-## Configure an enrolled device
+## Configure an enrolled agent
 
 Add the channel configuration to the OpenClaw configuration under
 `channels.unblock-linear`:
@@ -62,8 +62,7 @@ Add the channel configuration to the OpenClaw configuration under
       "enabled": true,
       "accountId": "default",
       "origin": "https://linear.unblocklabs.ai",
-      "agentId": "bill-01",
-      "deviceId": "bill-device-prod-3",
+      "agentId": "agt_your_agent_id",
       "enrollmentGeneration": 1,
       "devicePrivateKey": {
         "source": "env",
@@ -88,47 +87,67 @@ export UNBLOCK_LINEAR_DEVICE_PRIVATE_JWK='{"kty":"EC","crv":"P-256","x":"...","y
 ```
 
 Never put the private JWK directly in committed JSON, send it to the Worker, or
-paste it into support messages. The Worker needs only the public JWK during
-operator provisioning.
+paste it into support messages. The Worker setup CLI sends only the public JWK
+to the Worker.
 
 Restart the OpenClaw gateway after changing the plugin configuration. The
 plugin opens one authenticated WebSocket connection and resumes persisted work
 after reconnects.
 
-## Provisioning order for a new Linear app
+## Provision a new Linear app
 
-An operator must provision each app before the device can connect:
+From the Worker repository, load the deployment's admin token into the
+environment and run the interactive setup command:
 
-1. Call `POST /v1/admin/agents/reservations` on the production Worker.
-2. Use the returned unique `webhookUrl` when creating the Linear OAuth app.
-3. Use the fixed callback:
-   `https://linear.unblocklabs.ai/v1/linear/oauth/callback`.
-4. Call the reservation's `/complete` endpoint with the Linear client secret,
-   webhook signing secret, and scopes.
-5. Open the returned `oauthStartUrl` and complete OAuth.
-6. Configure OpenClaw with the enrolled device values above.
+```sh
+read -s ADMIN_API_TOKEN
+export ADMIN_API_TOKEN
+npm run setup:agent -- create
+```
+
+The CLI generates the agent enrollment key locally, creates a pending
+reservation, opens Linear's prefilled private-app form, and asks for the app's
+client ID, client secret, and webhook signing secret. It sends those credentials
+directly to the Worker, which validates the app identity, workspace, scopes, and
+Agent Sessions support before activation.
+
+The completed command prints `origin`, `agentId`, `enrollmentGeneration`, and
+`privateKeyFile`. Move the private-key file into an OpenClaw-approved
+secret store, create the corresponding `SecretRef`, and configure the channel
+with those printed values.
+
+Interrupted setup is resumable, and its local state can be inspected without an
+API call:
+
+```sh
+npm run setup:agent -- resume
+npm run setup:agent -- status
+```
 
 See the Worker repository's
 [`quickstart.md`](https://github.com/unblocklabs-ai/unblocked-linear-worker/blob/main/quickstart.md)
-for the exact reserve/complete curl commands. Do not put the admin token or
-Linear secrets in this plugin configuration.
+for environment selection, scripted non-secret inputs, and concurrent setup
+state. Do not put the admin token or Linear app credentials in this plugin
+configuration.
 
-## Reconnect after OAuth revocation
+## Replace a revoked Linear app
 
-If Linear OAuth is revoked, the plugin stops work and disables automatic
-reconnect. After reauthorizing the Linear app, run:
+An `installation.revoked` control is terminal for that enrollment. Provision a
+replacement from the Worker repository with the existing Worker `agentId`:
 
 ```sh
-openclaw unblock-linear reconnect
+npm run setup:agent -- replace \
+  --agent-id agt_your_existing_agent_id
 ```
 
-This makes exactly one fresh signed connection attempt. A successful attempt
-clears the local revoked state. A failed attempt remains revoked. If the
-enrollment generation is stale, reconnect refuses and tells the operator to
-update the enrollment configuration first; it never silently adopts a new
-device generation.
-
-Restarting OpenClaw also performs one connection attempt.
+Replacement does not disable an otherwise-active old installation and
+enrollment until the new private-app credentials and strictly newer generation
+are verified; an already-revoked installation remains offline. After setup
+succeeds, update the plugin configuration and private-key `SecretRef` from the
+new enrollment bundle, then restart OpenClaw. Only the updated enrollment can
+clear the plugin's persisted replacement/revocation fence: it must use the same
+`agentId`, a strictly newer generation, and successfully authenticate. You may
+then delete the old private app in Linear.
 
 ## The `linear` tool
 
@@ -155,20 +174,19 @@ Uploads accept only OpenClaw-approved inbound media references, request a
 Linear upload destination through GraphQL, validate the HTTPS destination, and
 stream the bytes directly to Linear. The plugin does not read arbitrary local
 paths, proxy general URLs, send file bytes through the WebSocket, or receive a
-Linear OAuth token.
+Linear access token.
 
 ## Troubleshooting
 
 ```sh
 openclaw plugins inspect unblock-linear
 openclaw doctor
-openclaw unblock-linear reconnect
 ```
 
 Common configuration failures are reported without secret values:
 
 - `origin`: use the exact production or staging Worker origin.
-- `agentId` / `deviceId`: use the values from operator provisioning.
+- `agentId`: use the value from operator provisioning.
 - `enrollmentGeneration`: use the current enrolled generation.
 - `devicePrivateKey`: use a valid OpenClaw SecretRef whose provider is
   configured on the gateway.
@@ -216,12 +234,16 @@ gh release create v0.2.0 --verify-tag --generate-notes --title v0.2.0
 
 ## Security boundary
 
-- The Worker stores Linear secrets encrypted with its control-plane key.
-- OpenClaw stores the device private key through its SecretRef system.
-- The Worker verifies signed device WebSocket upgrades and enrollment
+- The Worker stores the Linear private-app client and webhook credentials
+  encrypted with its control-plane key and mints short-lived access tokens as
+  needed.
+- OpenClaw stores the private enrollment key through its SecretRef system.
+- The plugin never receives a Linear client credential, webhook signing secret,
+  or access token.
+- The Worker verifies signed WebSocket upgrades and enrollment
   generations.
 - Local-file access for uploads remains subject to OpenClaw host approval.
-- Do not commit `.prod.secrets`, private JWKs, OAuth client secrets, webhook
+- Do not commit `.prod.secrets`, private JWKs, Linear client secrets, webhook
   secrets, or admin tokens.
 
 ## License

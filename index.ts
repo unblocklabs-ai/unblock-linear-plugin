@@ -9,10 +9,6 @@ import {
 } from "./src/config.js";
 import { setUnblockLinearRuntime } from "./src/runtime.js";
 import { createIntegrationRegistration } from "./src/integration.js";
-import {
-  registerReconnectCli,
-  registerReconnectGateway,
-} from "./src/reconnect.js";
 
 type UnblockLinearEntry = ReturnType<
   typeof defineChannelPluginEntry<ChannelPlugin<ResolvedUnblockLinearAccount>>
@@ -25,12 +21,10 @@ const unblockLinearEntry: UnblockLinearEntry = defineChannelPluginEntry({
   plugin: unblockLinearPlugin,
   configSchema: unblockLinearEntryConfigSchema,
   setRuntime: setUnblockLinearRuntime,
-  registerCliMetadata: registerReconnectCli,
   registerFull: (api) => {
     const integration = createIntegrationRegistration(api);
     api.registerService(integration.service);
     api.registerTool(integration.toolFactory);
-    registerReconnectGateway(api, integration);
   },
 });
 

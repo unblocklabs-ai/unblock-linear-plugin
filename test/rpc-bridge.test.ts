@@ -15,7 +15,6 @@ function request(id = 1): LinearGraphqlRpcRequest {
     id: uuid(id),
     type: "rpc.request",
     agentId: "agent",
-    deviceId: "device",
     timestamp: "2026-08-12T12:00:00.000Z",
     correlationId: uuid(1_000 + id),
     idempotencyKey: uuid(2_000 + id),
@@ -36,7 +35,6 @@ function result(
     id: uuid(id),
     type: "rpc.result",
     agentId: requestFrame.agentId,
-    deviceId: requestFrame.deviceId,
     timestamp: "2026-08-12T12:00:01.000Z",
     correlationId: requestFrame.correlationId,
     payload,
@@ -53,7 +51,7 @@ describe("RpcBridge", () => {
   it("recovers the exact request and correlated result after restart, then consumes after handoff", async () => {
     const { path, journal } = await fixture();
     const sendPersisted = vi.fn(async () => true);
-    const bridge = new RpcBridge({ journal, relayIdentity: { agentId: "agent", deviceId: "device" }, sendPersisted });
+    const bridge = new RpcBridge({ journal, relayIdentity: { agentId: "agent" }, sendPersisted });
     const created = request();
     expect(await bridge.getOrCreateRequest("tool-call-1", fingerprint(), () => created)).toEqual(created);
     const received = result(created, {
@@ -66,7 +64,7 @@ describe("RpcBridge", () => {
     const recoveredJournal = await RelayJournal.open(path);
     const recoveredBridge = new RpcBridge({
       journal: recoveredJournal,
-      relayIdentity: { agentId: "agent", deviceId: "device" },
+      relayIdentity: { agentId: "agent" },
       sendPersisted,
     });
     const recovered = await recoveredBridge.getOrCreateRequest("tool-call-1", fingerprint(), () => {
@@ -85,7 +83,7 @@ describe("RpcBridge", () => {
     const sent: LinearGraphqlRpcRequest[] = [];
     const bridge = new RpcBridge({
       journal,
-      relayIdentity: { agentId: "agent", deviceId: "device" },
+      relayIdentity: { agentId: "agent" },
       sendPersisted: vi.fn(async (frame) => {
         sent.push(frame);
         return sent.length === 1;
@@ -119,7 +117,7 @@ describe("RpcBridge", () => {
   it("keeps unauthorized results durable without polling", async () => {
     const { journal } = await fixture();
     const sendPersisted = vi.fn(async () => true);
-    const bridge = new RpcBridge({ journal, relayIdentity: { agentId: "agent", deviceId: "device" }, sendPersisted });
+    const bridge = new RpcBridge({ journal, relayIdentity: { agentId: "agent" }, sendPersisted });
     const persisted = await bridge.getOrCreateRequest("tool-call-3", fingerprint(), () => request(3));
     const pending = bridge.executePersisted("tool-call-3", persisted);
     const unauthorized = result(persisted, {
@@ -139,7 +137,7 @@ describe("RpcBridge", () => {
     const sendPersisted = vi.fn(async () => false);
     const bridge = new RpcBridge({
       journal,
-      relayIdentity: { agentId: "agent", deviceId: "device" },
+      relayIdentity: { agentId: "agent" },
       sendPersisted,
     });
     const persisted = await bridge.getOrCreateRequest("tool-call-offline", fingerprint(), () => request(5));
@@ -160,7 +158,7 @@ describe("RpcBridge", () => {
     const { journal } = await fixture();
     const bridge = new RpcBridge({
       journal,
-      relayIdentity: { agentId: "agent", deviceId: "device" },
+      relayIdentity: { agentId: "agent" },
       sendPersisted: vi.fn(async () => false),
     });
     const persisted = await bridge.getOrCreateRequest("tool-call-abort", fingerprint(), () => request(6));
@@ -180,7 +178,7 @@ describe("RpcBridge", () => {
     const { journal } = await fixture();
     const bridge = new RpcBridge({
       journal,
-      relayIdentity: { agentId: "agent", deviceId: "device" },
+      relayIdentity: { agentId: "agent" },
       sendPersisted: vi.fn(async () => false),
     });
     const persisted = await bridge.getOrCreateRequest("tool-call-terminal", fingerprint(), () => request(7));
@@ -201,15 +199,15 @@ describe("RpcBridge", () => {
     const { journal } = await fixture();
     const bridge = new RpcBridge({
       journal,
-      relayIdentity: { agentId: "agent", deviceId: "device" },
+      relayIdentity: { agentId: "agent" },
       sendPersisted: vi.fn(async () => false),
     });
     const persisted = await bridge.getOrCreateRequest("tool-call-device", fingerprint(), () => request(8));
     const pending = bridge.executePersisted("tool-call-device", persisted);
 
-    await bridge.rejectTerminal("device_replaced");
+    await bridge.rejectTerminal("enrollment_replaced");
 
-    await expect(pending).rejects.toMatchObject({ state: "device_replaced" });
+    await expect(pending).rejects.toMatchObject({ state: "enrollment_replaced" });
     expect(journal.getRpcInvocation("tool-call-device")?.request).toEqual(persisted);
   });
 
@@ -217,7 +215,7 @@ describe("RpcBridge", () => {
     const { journal } = await fixture();
     const bridge = new RpcBridge({
       journal,
-      relayIdentity: { agentId: "agent", deviceId: "device" },
+      relayIdentity: { agentId: "agent" },
       sendPersisted: vi.fn(async () => false),
     });
     const persisted = await bridge.getOrCreateRequest("namespaced-call", fingerprint(), () => request(9));
@@ -233,7 +231,7 @@ describe("RpcBridge", () => {
     const { journal } = await fixture();
     const bridge = new RpcBridge({
       journal,
-      relayIdentity: { agentId: "agent", deviceId: "device" },
+      relayIdentity: { agentId: "agent" },
       sendPersisted: vi.fn(async () => true),
     });
     const persisted = await bridge.getOrCreateRequest("tool-call-4", fingerprint(), () => request(4));

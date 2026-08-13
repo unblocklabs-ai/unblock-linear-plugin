@@ -97,14 +97,14 @@ type RelayStatusState =
   | "connected"
   | "reconnect_wait"
   | "revoked"
-  | "device_replaced";
+  | "enrollment_replaced";
 
 function relayStatusState(runtime: Record<string, unknown> | undefined): RelayStatusState {
   const value = runtime?.statusState;
   return value === "connected" ||
     value === "reconnect_wait" ||
     value === "revoked" ||
-    value === "device_replaced"
+    value === "enrollment_replaced"
     ? value
     : "stopped";
 }
@@ -116,7 +116,7 @@ function relayLifecycle(state: RelayStatusState) {
   if (state === "reconnect_wait") {
     return "recovering" as const;
   }
-  if (state === "revoked" || state === "device_replaced") {
+  if (state === "revoked" || state === "enrollment_replaced") {
     return "blocked" as const;
   }
   return "stopped" as const;
@@ -139,7 +139,7 @@ export const unblockLinearPlugin: ChannelPlugin<ResolvedUnblockLinearAccount> = 
         lifecycle: relayLifecycle(relayState),
         statusState: relayState,
         terminalDisconnect:
-          relayState === "revoked" || relayState === "device_replaced",
+          relayState === "revoked" || relayState === "enrollment_replaced",
         lastStartAt: runtimeTimestamp(safeRuntime, "lastStartAt"),
         lastStopAt: runtimeTimestamp(safeRuntime, "lastStopAt"),
       };

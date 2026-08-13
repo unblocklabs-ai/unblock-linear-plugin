@@ -15,7 +15,7 @@ export type RpcBridgeOptions = {
   maximumRetries?: number;
 };
 
-export type RpcBridgeTerminalState = "revoked" | "device_replaced" | "stopped";
+export type RpcBridgeTerminalState = "revoked" | "enrollment_replaced" | "stopped";
 
 export class RpcBridgeTerminalError extends Error {
   constructor(readonly state: RpcBridgeTerminalState) {

@@ -94,7 +94,6 @@ export type DeliveryExecutorOptions = {
   accountId: string;
   relayIdentity: {
     agentId: string;
-    deviceId: string;
   };
   relay: RelayPort;
   journal: DeliveryJournalPort;
@@ -642,7 +641,6 @@ export class DeliveryExecutor {
       id: this.createId(),
       type,
       agentId: this.options.relayIdentity.agentId,
-      deviceId: this.options.relayIdentity.deviceId,
       timestamp: this.now().toISOString(),
     };
   }

@@ -13,7 +13,6 @@ import { RelayService, type RelaySocket, type RelayTimer } from "../src/relay/se
 const account: DeviceAuthUpgradeInput = {
   origin: "https://linear-staging.unblocklabs.ai",
   agentId: "agent-1",
-  deviceId: "device-1",
   enrollmentGeneration: 1,
   privateKeyJwk: {
     kty: "EC",
@@ -27,7 +26,6 @@ const account: DeviceAuthUpgradeInput = {
 const base = {
   v: 1 as const,
   agentId: account.agentId,
-  deviceId: account.deviceId,
   timestamp: "2026-08-12T12:00:00.000Z",
 };
 
@@ -136,7 +134,7 @@ describe("RelayService", () => {
     const socket = new NeverClosingSocket();
     const timer = new FakeTimer();
     const service = new RelayService({
-      account,
+      account: { ...account, enrollmentGeneration: 2 },
       journal,
       leasePath,
       timers: timer,
@@ -700,7 +698,7 @@ describe("RelayService", () => {
     await service.stop();
   });
 
-  it("persists and fences an explicit device replacement control", async () => {
+  it("persists and fences an explicit enrollment replacement control", async () => {
     const { journal, leasePath } = await createJournal();
     const socket = new FakeSocket();
     const replaced: number[] = [];
@@ -711,7 +709,7 @@ describe("RelayService", () => {
       leasePath,
       socketFactory: () => socket as unknown as RelaySocket,
       callbacks: {
-        onDeviceReplaced: (generation) => { replaced.push(generation); },
+        onEnrollmentReplaced: (generation) => { replaced.push(generation); },
         onTerminal: (reason) => { terminal.push(reason); },
       },
     });
@@ -721,21 +719,21 @@ describe("RelayService", () => {
       ...base,
       id: "40000000-0000-4000-8000-000000000001",
       type: "control",
-      payload: { kind: "device.replaced", generation: 2 },
+      payload: { kind: "enrollment.replaced", generation: 2 },
     }));
-    await waitFor(() => expect(service.getState()).toBe("device_replaced"));
+    await waitFor(() => expect(service.getState()).toBe("enrollment_replaced"));
     expect(journal.getLifecycle()).toEqual({
-      fence: "device_replaced",
+      fence: "enrollment_replaced",
       generation: 2,
-      enrollment: { agentId: "agent-1", deviceId: "device-1", enrollmentGeneration: 1 },
+      enrollment: { agentId: "agent-1", enrollmentGeneration: 1 },
     });
     expect(replaced).toEqual([2]);
-    expect(terminal).toEqual(["device_replaced"]);
+    expect(terminal).toEqual(["enrollment_replaced"]);
     expect(socket.closes.at(-1)).toMatchObject({ code: 4001 });
     await service.stop();
   });
 
-  it("fences the old enrollment when the Worker sends the new device identity then immediately closes", async () => {
+  it("fences the old enrollment when the Worker sends the new enrollment generation then immediately closes", async () => {
     const { journal, leasePath } = await createJournal();
     const socket = new FakeSocket();
     const timer = new FakeTimer();
@@ -749,7 +747,7 @@ describe("RelayService", () => {
       socketFactory: () => socket as unknown as RelaySocket,
       acquireLease: vi.fn(async () => ({ release })),
       callbacks: {
-        onDeviceReplaced: (generation) => { replaced.push(generation); },
+        onEnrollmentReplaced: (generation) => { replaced.push(generation); },
       },
     });
     await service.start();
@@ -759,16 +757,15 @@ describe("RelayService", () => {
       ...base,
       id: "40000000-0000-4000-8000-000000000002",
       type: "control",
-      deviceId: "device-2",
-      payload: { kind: "device.replaced", generation: 2 },
+      payload: { kind: "enrollment.replaced", generation: 2 },
     }));
     socket.close(4001, "Device enrollment rotated");
 
-    await waitFor(() => expect(service.getState()).toBe("device_replaced"));
+    await waitFor(() => expect(service.getState()).toBe("enrollment_replaced"));
     expect(journal.getLifecycle()).toEqual({
-      fence: "device_replaced",
+      fence: "enrollment_replaced",
       generation: 2,
-      enrollment: { agentId: "agent-1", deviceId: "device-1", enrollmentGeneration: 1 },
+      enrollment: { agentId: "agent-1", enrollmentGeneration: 1 },
     });
     expect(replaced).toEqual([2]);
     expect(timer.scheduled).toEqual([]);
@@ -782,8 +779,7 @@ describe("RelayService", () => {
         ...base,
         id: "40000000-0000-4000-8000-000000000003",
         type: "control",
-        deviceId: "device-2",
-        payload: { kind: "device.replaced", generation: 1 },
+        payload: { kind: "enrollment.replaced", generation: 1 },
       },
     },
     {
@@ -793,29 +789,7 @@ describe("RelayService", () => {
         id: "40000000-0000-4000-8000-000000000004",
         type: "control",
         agentId: "other-agent",
-        deviceId: "device-2",
-        payload: { kind: "device.replaced", generation: 2 },
-      },
-    },
-    {
-      name: "another control kind stamped with a different device",
-      frame: {
-        ...base,
-        id: "40000000-0000-4000-8000-000000000005",
-        type: "control",
-        deviceId: "device-2",
-        payload: { kind: "installation.revoked" },
-      },
-    },
-    {
-      name: "a non-control frame stamped with a different device",
-      frame: {
-        ...base,
-        id: "40000000-0000-4000-8000-000000000006",
-        type: "rpc.result",
-        deviceId: "device-2",
-        correlationId: "40000000-0000-4000-8000-000000000007",
-        payload: { ok: true, result: {} },
+        payload: { kind: "enrollment.replaced", generation: 2 },
       },
     },
   ])("policy-closes $name without creating a replacement fence", async ({ frame }) => {
@@ -837,13 +811,13 @@ describe("RelayService", () => {
     await waitFor(() => expect(service.getState()).toBe("stopped"));
   });
 
-  it("uses one awaitable signed probe on revoked startup and clears the fence only after open", async () => {
+  it("uses one awaitable signed replacement probe on revoked startup and clears the fence only after open", async () => {
     const { journal, leasePath } = await createJournal();
-    await journal.setLifecycle("revoked");
+    await journal.setLifecycle("revoked", { agentId: "agent-1", enrollmentGeneration: 1 });
     const socket = new FakeSocket();
     let created = false;
     const service = new RelayService({
-      account,
+      account: { ...account, enrollmentGeneration: 2 },
       journal,
       leasePath,
       socketFactory: () => {
@@ -855,7 +829,7 @@ describe("RelayService", () => {
     const started = service.start();
     await waitFor(() => expect(created).toBe(true));
     expect(service.getState()).toBe("starting");
-    expect(journal.getLifecycle()).toEqual({ fence: "revoked" });
+    expect(journal.getLifecycle()).toMatchObject({ fence: "revoked" });
     socket.open();
 
     await expect(started).resolves.toBe(true);
@@ -864,16 +838,42 @@ describe("RelayService", () => {
     await service.stop();
   });
 
+  it.each([
+    ["unchanged", account],
+    ["rollback", { ...account, enrollmentGeneration: 0 }],
+    ["cross-agent", { ...account, agentId: "other-agent", enrollmentGeneration: 2 }],
+  ] as const)("refuses a %s enrollment behind a revoked fence", async (_name, configured) => {
+    const { journal, leasePath } = await createJournal();
+    const fenced = { agentId: "agent-1", enrollmentGeneration: 1 };
+    await journal.setLifecycle("revoked", fenced);
+    const socketFactory = vi.fn(() => new FakeSocket() as unknown as RelaySocket);
+    const acquireLease = vi.fn(async () => ({ release: vi.fn(async () => undefined) }));
+    const service = new RelayService({
+      account: configured,
+      journal,
+      leasePath,
+      socketFactory,
+      acquireLease,
+    });
+
+    await expect(service.start()).resolves.toBe(false);
+
+    expect(service.getState()).toBe("revoked");
+    expect(journal.getLifecycle()).toEqual({ fence: "revoked", enrollment: fenced });
+    expect(acquireLease).not.toHaveBeenCalled();
+    expect(socketFactory).not.toHaveBeenCalled();
+  });
+
   it("keeps revoked state after the one startup probe closes before open", async () => {
     const { journal, leasePath } = await createJournal();
-    await journal.setLifecycle("revoked");
+    await journal.setLifecycle("revoked", { agentId: "agent-1", enrollmentGeneration: 1 });
     const socket = new FakeSocket();
     const timer = new FakeTimer();
     const release = vi.fn(async () => undefined);
     const acquireLease = vi.fn(async () => ({ release }));
     let created = false;
     const service = new RelayService({
-      account,
+      account: { ...account, enrollmentGeneration: 2 },
       journal,
       leasePath,
       timers: timer,
@@ -890,7 +890,7 @@ describe("RelayService", () => {
 
     await expect(started).resolves.toBe(false);
     expect(service.getState()).toBe("revoked");
-    expect(journal.getLifecycle()).toEqual({ fence: "revoked" });
+    expect(journal.getLifecycle()).toMatchObject({ fence: "revoked" });
     expect(timer.scheduled).toEqual([]);
     expect(acquireLease).toHaveBeenCalledOnce();
     expect(release).toHaveBeenCalledOnce();
@@ -899,7 +899,7 @@ describe("RelayService", () => {
 
   it("settles a 4003 startup probe only after terminal persistence, then permits an immediate reopen", async () => {
     const { journal, journalPath, leasePath } = await createJournal();
-    await journal.setLifecycle("revoked");
+    await journal.setLifecycle("revoked", { agentId: "agent-1", enrollmentGeneration: 1 });
     const probeSocket = new FakeSocket();
     let probeCreated = false;
     let releaseTerminal: (() => void) | undefined;
@@ -908,7 +908,7 @@ describe("RelayService", () => {
       releaseTerminal = resolve;
     });
     const service = new RelayService({
-      account,
+      account: { ...account, enrollmentGeneration: 2 },
       journal,
       leasePath,
       socketFactory: () => {
@@ -931,7 +931,7 @@ describe("RelayService", () => {
     await settle();
 
     expect(settled).toBe(false);
-    expect(journal.getLifecycle()).toEqual({ fence: "revoked" });
+    expect(journal.getLifecycle()).toMatchObject({ fence: "revoked" });
     await waitFor(() => expect(terminalEntered).toBe(true));
     releaseTerminal?.();
     await expect(started).resolves.toBe(false);
@@ -940,7 +940,7 @@ describe("RelayService", () => {
     const reconnectSocket = new FakeSocket();
     let reconnectCreated = false;
     const reconnect = new RelayService({
-      account,
+      account: { ...account, enrollmentGeneration: 3 },
       journal: reopened,
       leasePath,
       socketFactory: () => {
@@ -957,14 +957,14 @@ describe("RelayService", () => {
 
   it("does not retry or retain the lease when a revoked startup probe cannot construct a socket", async () => {
     const { journal, leasePath } = await createJournal();
-    await journal.setLifecycle("revoked");
+    await journal.setLifecycle("revoked", { agentId: "agent-1", enrollmentGeneration: 1 });
     const timer = new FakeTimer();
     const release = vi.fn(async () => undefined);
     const socketFactory = vi.fn(() => {
       throw new Error("upgrade failed");
     });
     const service = new RelayService({
-      account,
+      account: { ...account, enrollmentGeneration: 2 },
       journal,
       leasePath,
       timers: timer,
@@ -975,7 +975,7 @@ describe("RelayService", () => {
     await expect(service.start()).resolves.toBe(false);
 
     expect(service.getState()).toBe("revoked");
-    expect(journal.getLifecycle()).toEqual({ fence: "revoked" });
+    expect(journal.getLifecycle()).toMatchObject({ fence: "revoked" });
     expect(socketFactory).toHaveBeenCalledOnce();
     expect(timer.scheduled).toEqual([]);
     expect(release).toHaveBeenCalledOnce();
@@ -997,11 +997,10 @@ describe("RelayService", () => {
     await service.stop();
   });
 
-  it("refuses a device-replaced fence without acquiring a lease or creating a socket", async () => {
+  it("refuses a enrollment-replaced fence without acquiring a lease or creating a socket", async () => {
     const { journal, leasePath } = await createJournal();
-    await journal.setLifecycle("device_replaced", 2, {
+    await journal.setLifecycle("enrollment_replaced", 2, {
       agentId: "agent-1",
-      deviceId: "device-1",
       enrollmentGeneration: 1,
     });
     const acquireLease = vi.fn(async () => ({ release: vi.fn(async () => undefined) }));
@@ -1010,12 +1009,12 @@ describe("RelayService", () => {
 
     await expect(service.start()).resolves.toBe(false);
 
-    expect(service.getState()).toBe("device_replaced");
+    expect(service.getState()).toBe("enrollment_replaced");
     expect(acquireLease).not.toHaveBeenCalled();
     expect(socketFactory).not.toHaveBeenCalled();
   });
 
-  it("makes one replacement probe and replays rebound frames only after authenticated open", async () => {
+  it("makes one replacement probe and replays retained frames only after authenticated open", async () => {
     const { journal, leasePath } = await createJournal();
     const pending = outbound({
       ...base,
@@ -1030,12 +1029,11 @@ describe("RelayService", () => {
     });
     if (pending.type !== "activity") throw new Error("Unexpected test frame type");
     await journal.addReplay({ key: "activity", kind: "activity", deliveryId: "delivery-1", frame: pending });
-    await journal.setLifecycle("device_replaced", 2, {
+    await journal.setLifecycle("enrollment_replaced", 2, {
       agentId: "agent-1",
-      deviceId: "device-1",
       enrollmentGeneration: 1,
     });
-    const replacement = { ...account, deviceId: "device-2", enrollmentGeneration: 2 };
+    const replacement = { ...account, enrollmentGeneration: 2 };
     const socket = new FakeSocket();
     const timer = new FakeTimer();
     const socketFactory = vi.fn(() => socket as unknown as RelaySocket);
@@ -1044,12 +1042,11 @@ describe("RelayService", () => {
     const started = service.start();
     await waitFor(() => expect(socketFactory).toHaveBeenCalledOnce());
     expect(socket.sent).toEqual([]);
-    expect(journal.getLifecycle().fence).toBe("device_replaced");
+    expect(journal.getLifecycle().fence).toBe("enrollment_replaced");
     socket.open();
 
     await expect(started).resolves.toBe(true);
     expect(journal.getLifecycle()).toEqual({ fence: "normal" });
-    expect(socket.sent.map((value) => parseOutboundRelayFrame(value).deviceId)).toEqual(["device-2"]);
     socket.close(1006, "connection lost");
     await waitFor(() => expect(timer.scheduled).toHaveLength(1));
     await service.stop();
@@ -1057,12 +1054,11 @@ describe("RelayService", () => {
 
   it("reconnects when the authenticated replacement socket closes during journal activation", async () => {
     const { journal, leasePath } = await createJournal();
-    await journal.setLifecycle("device_replaced", 2, {
+    await journal.setLifecycle("enrollment_replaced", 2, {
       agentId: "agent-1",
-      deviceId: "device-1",
       enrollmentGeneration: 1,
     });
-    const replacement = { ...account, deviceId: "device-2", enrollmentGeneration: 2 };
+    const replacement = { ...account, enrollmentGeneration: 2 };
     let resumeActivation: (() => void) | undefined;
     const activationPaused = new Promise<void>((resolve) => {
       resumeActivation = resolve;
@@ -1097,7 +1093,7 @@ describe("RelayService", () => {
     firstSocket.close(1006, "connection lost during activation");
     await settle();
 
-    expect(journal.getLifecycle().fence).toBe("device_replaced");
+    expect(journal.getLifecycle().fence).toBe("enrollment_replaced");
     expect(timer.scheduled).toEqual([]);
     expect(release).not.toHaveBeenCalled();
 
@@ -1119,9 +1115,8 @@ describe("RelayService", () => {
 
   it("fails closed when replacement journal activation fails after authenticated open", async () => {
     const { journal, leasePath } = await createJournal();
-    await journal.setLifecycle("device_replaced", 2, {
+    await journal.setLifecycle("enrollment_replaced", 2, {
       agentId: "agent-1",
-      deviceId: "device-1",
       enrollmentGeneration: 1,
     });
     vi.spyOn(journal, "activateReplacement").mockRejectedValue(new Error("disk unavailable"));
@@ -1129,7 +1124,7 @@ describe("RelayService", () => {
     const release = vi.fn(async () => undefined);
     const timer = new FakeTimer();
     const service = new RelayService({
-      account: { ...account, deviceId: "device-2", enrollmentGeneration: 2 },
+      account: { ...account, enrollmentGeneration: 2 },
       journal,
       leasePath,
       timers: timer,
@@ -1142,25 +1137,24 @@ describe("RelayService", () => {
     socket.open();
 
     await expect(started).resolves.toBe(false);
-    expect(service.getState()).toBe("device_replaced");
-    expect(journal.getLifecycle()).toMatchObject({ fence: "device_replaced", generation: 2 });
-    expect(socket.closes).toContainEqual({ code: 1011, reason: "Replacement activation failed" });
+    expect(service.getState()).toBe("enrollment_replaced");
+    expect(journal.getLifecycle()).toMatchObject({ fence: "enrollment_replaced", generation: 2 });
+    expect(socket.closes).toContainEqual({ code: 1011, reason: "Enrollment activation failed" });
     expect(release).toHaveBeenCalledOnce();
     expect(timer.scheduled).toEqual([]);
   });
 
   it("keeps a replacement fence after one failed probe and does not retry", async () => {
     const { journal, leasePath } = await createJournal();
-    await journal.setLifecycle("device_replaced", 2, {
+    await journal.setLifecycle("enrollment_replaced", 2, {
       agentId: "agent-1",
-      deviceId: "device-1",
       enrollmentGeneration: 1,
     });
     const socket = new FakeSocket();
     const timer = new FakeTimer();
     const socketFactory = vi.fn(() => socket as unknown as RelaySocket);
     const service = new RelayService({
-      account: { ...account, deviceId: "device-2", enrollmentGeneration: 2 },
+      account: { ...account, enrollmentGeneration: 2 },
       journal,
       leasePath,
       socketFactory,
@@ -1172,23 +1166,22 @@ describe("RelayService", () => {
     socket.close(1006, "network failure");
 
     await expect(started).resolves.toBe(false);
-    expect(service.getState()).toBe("device_replaced");
+    expect(service.getState()).toBe("enrollment_replaced");
     expect(journal.getLifecycle()).toMatchObject({
-      fence: "device_replaced",
-      enrollment: { deviceId: "device-1" },
+      fence: "enrollment_replaced",
+      enrollment: { agentId: "agent-1", enrollmentGeneration: 1 },
     });
     expect(timer.scheduled).toEqual([]);
   });
 
   it("refreshes an exact rejected replacement probe with the attempted enrollment", async () => {
     const { journal, leasePath } = await createJournal();
-    await journal.setLifecycle("device_replaced", 2, {
+    await journal.setLifecycle("enrollment_replaced", 2, {
       agentId: "agent-1",
-      deviceId: "device-1",
       enrollmentGeneration: 1,
     });
     const socket = new FakeSocket();
-    const replacement = { ...account, deviceId: "device-2", enrollmentGeneration: 2 };
+    const replacement = { ...account, enrollmentGeneration: 2 };
     const socketFactory = vi.fn(() => socket as unknown as RelaySocket);
     const service = new RelayService({
       account: replacement,
@@ -1199,15 +1192,15 @@ describe("RelayService", () => {
 
     const started = service.start();
     await waitFor(() => expect(socketFactory).toHaveBeenCalledOnce());
-    socket.unexpectedResponse(409, '{"error":"device_replaced"}');
-    await waitFor(() => expect(service.getState()).toBe("device_replaced"));
+    socket.unexpectedResponse(409, '{"error":"enrollment_replaced"}');
+    await waitFor(() => expect(service.getState()).toBe("enrollment_replaced"));
     socket.close(1006, "upgrade rejected");
 
     await expect(started).resolves.toBe(false);
     expect(journal.getLifecycle()).toEqual({
-      fence: "device_replaced",
+      fence: "enrollment_replaced",
       generation: 2,
-      enrollment: { agentId: "agent-1", deviceId: "device-2", enrollmentGeneration: 2 },
+      enrollment: { agentId: "agent-1", enrollmentGeneration: 2 },
     });
   });
 
@@ -1229,32 +1222,32 @@ describe("RelayService", () => {
 
     const started = service.start({ awaitOpen: true });
     await waitFor(() => expect(created).toBe(true));
-    socket.unexpectedResponse(409, '{"error":"device_replaced"}');
-    await waitFor(() => expect(service.getState()).toBe("device_replaced"));
+    socket.unexpectedResponse(409, '{"error":"enrollment_replaced"}');
+    await waitFor(() => expect(service.getState()).toBe("enrollment_replaced"));
     socket.close(1006, "upgrade rejected");
 
     await expect(started).resolves.toBe(false);
     expect(journal.getLifecycle()).toEqual({
-      fence: "device_replaced",
+      fence: "enrollment_replaced",
       generation: account.enrollmentGeneration,
-      enrollment: { agentId: "agent-1", deviceId: "device-1", enrollmentGeneration: 1 },
+      enrollment: { agentId: "agent-1", enrollmentGeneration: 1 },
     });
-    expect(terminal).toEqual(["device_replaced"]);
+    expect(terminal).toEqual(["enrollment_replaced"]);
   });
 
   it.each([
-    [401, '{"error":"device_replaced"}'],
-    [409, '{"error":"device_replaced","detail":"extra"}'],
+    [401, '{"error":"enrollment_replaced"}'],
+    [409, '{"error":"enrollment_replaced","detail":"extra"}'],
     [409, '{"error":"device_authentication_failed"}'],
     [409, "not-json"],
     [409, undefined],
   ] as const)("keeps generic upgrade rejection %s content-free", async (statusCode, body) => {
     const { journal, leasePath } = await createJournal();
-    await journal.setLifecycle("revoked");
+    await journal.setLifecycle("revoked", { agentId: "agent-1", enrollmentGeneration: 1 });
     const socket = new FakeSocket();
     let created = false;
     const service = new RelayService({
-      account,
+      account: { ...account, enrollmentGeneration: 2 },
       journal,
       leasePath,
       socketFactory: () => {
@@ -1270,7 +1263,7 @@ describe("RelayService", () => {
 
     await expect(started).resolves.toBe(false);
     expect(service.getState()).toBe("revoked");
-    expect(journal.getLifecycle()).toEqual({ fence: "revoked" });
+    expect(journal.getLifecycle()).toMatchObject({ fence: "revoked" });
   });
 
   it("treats an unexplained 4001 close as reconnectable rather than a replacement fence", async () => {

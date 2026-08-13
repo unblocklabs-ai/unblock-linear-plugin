@@ -19,7 +19,7 @@
     "plugin-inspector.config.json"
   ],
   "scripts": {
-    "build": "tsc -p tsconfig.build.json",
+    "build": "node scripts/clean-dist.mjs && tsc -p tsconfig.build.json",
     "check": "tsc -p tsconfig.json --noEmit",
     "test": "vitest run",
     "plugin:inspect": "plugin-inspector check --config plugin-inspector.config.json --no-openclaw",
