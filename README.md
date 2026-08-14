@@ -259,11 +259,22 @@ Replace the illustrative UUIDs with IDs returned by your workspace.
 Use Linear UUIDs rather than names for teams, workflow states, and assignees.
 Issue reads, updates, and comments also accept a human-readable issue identifier
 such as `ENG-123`. List teams and workflow states first when a UUID is unknown,
-and follow `pageInfo.endCursor` only when more results are needed. On
-`issues.search`, `teamId` filters results to that team; it is not a ranking
-hint. List actions accept at most 50 results per page; search accepts at most 20
-and has a tighter Linear rate limit than ordinary issue reads, so prefer a
-specific query and avoid polling it.
+and follow `pageInfo.endCursor` with `after` only while
+`pageInfo.hasNextPage` is true. No action auto-paginates.
+
+`issues.search` uses Linear's ranked full-text/vector search. Its `first` value
+is a page-size maximum, not a promised node count, so pages may be sparse.
+`totalCount` is the matching count before pagination. Never infer completion
+from `nodes.length`; use `hasNextPage` and its `endCursor`. `teamId` filters the
+matches to that team rather than changing their ranking. Search accepts at most
+20 results per page and has a tighter Linear rate limit than ordinary issue
+reads, so prefer a specific query and avoid polling it. Other list actions
+accept at most 50 results per page.
+
+When `issues.get` cannot see the requested issue, it returns a safe typed error
+with `status: "error"` and `code: "not_found"`. This deliberately covers both a
+missing issue and one inaccessible to the installation. Do not infer which case
+occurred.
 
 Use `action: "graphql"` only when the typed actions cannot express the needed
 operation. Every typed action is compiled to a bounded GraphQL operation,
@@ -282,6 +293,10 @@ its `code`, and follow any `entityId`. This keeps typed-action parameters out of
 the host adapter's failed-tool parameter-logging path. This behavior applies
 only to the typed actions above—not raw `graphql` or `upload`—and is not a claim
 that OpenClaw omits parameters from every log surface.
+
+OpenClaw's direct tool runtime returns these values as JSON text in `content`.
+The same native value is retained in `details` for Code Mode and Tool Search.
+The plugin does not return `structuredContent`.
 
 Uploads accept only OpenClaw-approved inbound media references, request a
 Linear upload destination through GraphQL, validate the HTTPS destination, and

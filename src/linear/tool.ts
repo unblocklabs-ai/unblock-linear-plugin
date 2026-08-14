@@ -15,6 +15,7 @@ import {
 import { MANAGED_MEDIA_REF_PATTERN } from "./media-ref.js";
 import {
   LINEAR_OPERATION_ACTIONS,
+  LinearOperationNotFoundError,
   compileLinearOperation,
   linearOperationInputSchemas,
   type LinearMutationReconciliation,
@@ -99,6 +100,7 @@ export type LinearToolErrorCode =
   | "not_available"
   | "state_unavailable"
   | "invalid_request"
+  | "not_found"
   | "unauthorized"
   | "retryable"
   | "outcome_unknown"
@@ -118,6 +120,13 @@ export class LinearToolError extends Error {
 }
 
 const typedLinearActions = new Set<string>(LINEAR_OPERATION_ACTIONS);
+
+function compactJsonResult<T>(details: T) {
+  return {
+    content: [{ type: "text" as const, text: JSON.stringify(details) }],
+    details,
+  };
+}
 
 function isTypedLinearAction(value: unknown): boolean {
   if (value === null || typeof value !== "object" || Array.isArray(value)) return false;
@@ -139,6 +148,7 @@ function safeTypedFailure(error: unknown) {
       case "not_available": return "Linear is not available for this request.";
       case "state_unavailable": return "Linear is unavailable for this run. Check the plugin connection state.";
       case "invalid_request": return "Linear rejected the request as invalid.";
+      case "not_found": return "Linear issue was not found or is not accessible.";
       case "unauthorized": return "This Linear request is no longer authorized.";
       case "retryable": return "Linear is temporarily unavailable. Retry the same durable request.";
       case "outcome_unknown":
@@ -602,10 +612,7 @@ export function createLinearTool(
           request.signal,
         ),
       });
-      return {
-        content: [{ type: "text" as const, text: JSON.stringify(uploaded) }],
-        details: uploaded,
-      };
+      return compactJsonResult(uploaded);
     }
 
     if (input.action !== "graphql") {
@@ -618,19 +625,21 @@ export function createLinearTool(
         signal,
         operation.reconciliation,
       );
-      const typedResult = operation.parseResult(graphqlResult);
-      return {
-        content: [{ type: "text" as const, text: JSON.stringify(typedResult) }],
-        details: typedResult,
-      };
+      let typedResult: unknown;
+      try {
+        typedResult = operation.parseResult(graphqlResult);
+      } catch (error) {
+        if (error instanceof LinearOperationNotFoundError) {
+          throw new LinearToolError("not_found", "Linear issue was not found or is not accessible.");
+        }
+        throw error;
+      }
+      return compactJsonResult(typedResult);
     }
 
     const graphqlResult = await executeGraphql(toolCallId, input.action, input, runBinding, signal);
 
-    return {
-      content: [{ type: "text" as const, text: JSON.stringify(graphqlResult) }],
-      details: graphqlResult,
-    };
+    return compactJsonResult(graphqlResult);
   };
 
   return {
@@ -645,10 +654,7 @@ export function createLinearTool(
       } catch (error) {
         if (!typedAction || isAbortFailure(error, signal)) throw error;
         const failure = safeTypedFailure(error);
-        return {
-          content: [{ type: "text", text: JSON.stringify(failure) }],
-          details: failure,
-        };
+        return compactJsonResult(failure);
       }
     },
   };

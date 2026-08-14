@@ -1,6 +1,7 @@
 import { describe, expect, it } from "vitest";
 import {
   LINEAR_OPERATION_ACTIONS,
+  LinearOperationNotFoundError,
   compileLinearOperation,
   linearOperationInputSchema,
   linearOperationInputSchemas,
@@ -42,6 +43,14 @@ describe("typed Linear operations", () => {
     expect(linearOperationInputSchema.safeParse({ action: "issues.search", query: "bug", first: 20 }).success).toBe(true);
     expect(linearOperationInputSchema.safeParse({ action: "issues.search", query: "bug", first: 21 }).success).toBe(false);
     expect(linearOperationInputSchema.safeParse({ action: "issues.get", id: "ENG-123", extra: true }).success).toBe(false);
+    expect(linearOperationInputSchema.safeParse({ action: "issues.get", id: ids.issue }).success).toBe(true);
+    expect(linearOperationInputSchema.safeParse({ action: "issues.get", id: "ULD-8" }).success).toBe(true);
+    expect(linearOperationInputSchema.safeParse({ action: "issues.get", id: "uld-8" }).success).toBe(false);
+    expect(linearOperationInputSchema.safeParse({ action: "issues.get", id: "ULD-0" }).success).toBe(false);
+    expect(linearOperationInputSchema.safeParse({
+      action: "issues.get",
+      id: `ULD-${Number.MAX_SAFE_INTEGER}0`,
+    }).success).toBe(false);
     expect(linearOperationInputSchema.safeParse({ action: "issues.update", id: "ENG-123" }).success).toBe(false);
     expect(linearOperationInputSchema.safeParse({
       action: "issues.create",
@@ -88,7 +97,39 @@ describe("typed Linear operations", () => {
       includeArchived: false,
     });
     expect(operation.graphql.document).toContain("searchIssues(");
+    expect(operation.graphql.document).toMatch(/\btotalCount\b/u);
     expect(operation.graphql.document).not.toMatch(/\bissueSearch\b/u);
+  });
+
+  it("preserves sparse search pagination and exposes the total matching count", () => {
+    const operation = compileLinearOperation({
+      action: "issues.search",
+      query: "exact title",
+      first: 10,
+      after: "search-cursor-1",
+    }, () => ids.created);
+    const sparsePage = {
+      totalCount: 7,
+      nodes: [issue],
+      pageInfo: { hasNextPage: true, endCursor: "search-cursor-2" },
+    };
+
+    expect(operation.graphql.variables).toMatchObject({
+      first: 10,
+      after: "search-cursor-1",
+    });
+    expect(operation.parseResult({ data: { searchIssues: sparsePage } })).toEqual(sparsePage);
+  });
+
+  it.each([
+    undefined,
+    -1,
+    Number.POSITIVE_INFINITY,
+  ])("rejects malformed search totalCount %s", (totalCount) => {
+    const operation = compileLinearOperation({ action: "issues.search", query: "relay" }, () => ids.created);
+    expect(() => operation.parseResult({
+      data: { searchIssues: { totalCount, nodes: [issue], pageInfo } },
+    })).toThrow("Linear returned an invalid typed operation result.");
   });
 
   it("constrains issue search by team through IssueFilter instead of the ranking hint", () => {
@@ -177,14 +218,12 @@ describe("typed Linear operations", () => {
   it("compiles discovery queries with explicit IDs and small pagination", () => {
     const teams = compileLinearOperation({ action: "teams.list" }, () => ids.created);
     const states = compileLinearOperation({ action: "states.list", teamId: ids.team }, () => ids.created);
-    const get = compileLinearOperation({ action: "issues.get", id: "ENG-123" }, () => ids.created);
 
     expect(teams.graphql.variables).toEqual({ first: 20, includeArchived: false });
     expect(states.graphql.variables).toEqual({
       first: 20,
       filter: { team: { id: { eq: ids.team } } },
     });
-    expect(get.graphql.variables).toEqual({ id: "ENG-123" });
   });
 
   it("returns only runtime-validated fixed projections", () => {
@@ -196,11 +235,45 @@ describe("typed Linear operations", () => {
     });
   });
 
-  it("returns descriptions only for an individual issue read", () => {
-    const operation = compileLinearOperation({ action: "issues.get", id: "ENG-123" }, () => ids.created);
+  it.each([
+    {
+      reference: ids.issue,
+      filter: { id: { eq: ids.issue } },
+    },
+    {
+      reference: "ULD-8",
+      filter: { team: { key: { eq: "ULD" } }, number: { eq: 8 } },
+    },
+  ])("compiles an exact bounded issue lookup for $reference", ({ reference, filter }) => {
+    const operation = compileLinearOperation({ action: "issues.get", id: reference }, () => ids.created);
 
     expect(operation.graphql.document).toMatch(/\bdescription\b/u);
-    expect(operation.parseResult({ data: { issue: issueDetail } })).toEqual(issueDetail);
+    expect(operation.graphql.document).toContain("issues(first:");
+    expect(operation.graphql.variables).toEqual({ first: 2, filter, includeArchived: true });
+  });
+
+  it("returns one exact issue detail and reports a missing issue with a sentinel", () => {
+    const operation = compileLinearOperation({ action: "issues.get", id: "ULD-8" }, () => ids.created);
+
+    expect(operation.parseResult({ data: { issues: { nodes: [issueDetail] } } })).toEqual(issueDetail);
+    expect(() => operation.parseResult({ data: { issues: { nodes: [] } } }))
+      .toThrow(LinearOperationNotFoundError);
+  });
+
+  it.each([
+    { data: { issues: { nodes: [issueDetail, issueDetail] } } },
+    { data: { issues: { nodes: [] } }, errors: [{ message: "not found" }] },
+  ])("fails closed rather than treating an ambiguous or errored issue lookup as not found", (envelope) => {
+    const operation = compileLinearOperation({ action: "issues.get", id: "ULD-8" }, () => ids.created);
+    let thrown: unknown;
+    try {
+      operation.parseResult(envelope);
+    } catch (error) {
+      thrown = error;
+    }
+    expect(thrown).toBeInstanceOf(Error);
+    expect(thrown).not.toBeInstanceOf(LinearOperationNotFoundError);
+    expect(thrown).toMatchObject({ message: "Linear returned an invalid typed operation result." });
   });
 
   it.each([

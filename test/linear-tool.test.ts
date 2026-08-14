@@ -127,6 +127,10 @@ describe("linear tool", () => {
     expect(request.payload.params.contextId).toMatch(/^oc_[A-Za-z0-9_-]{43}$/u);
     expect(request.payload.params.contextId).not.toContain("host-session");
     expect(result.details).toEqual(envelope);
+    expect(result.content).toEqual([{
+      type: "text",
+      text: JSON.stringify(envelope),
+    }]);
     expect(JSON.parse(result.content[0]?.type === "text" ? result.content[0].text : ""))
       .toEqual(envelope);
   });
@@ -158,12 +162,50 @@ describe("linear tool", () => {
       },
     });
     expect(result.details).toEqual(response);
+    expect(result.content).toEqual([{
+      type: "text",
+      text: JSON.stringify(response),
+    }]);
+  });
+
+  it("returns a consumed safe not_found result without exposing Linear diagnostics", async () => {
+    const { port, events } = rpcPort((request) => rpcResult(request, {
+      ok: true,
+      result: {
+        data: { issues: { nodes: [] } },
+        extensions: { diagnostic: "secret Linear diagnostic" },
+      },
+    }));
+    const tool = createLinearTool({ rpc: port }, hostContext());
+
+    const result = await tool.execute("missing-issue", {
+      action: "issues.get",
+      id: "ENG-404",
+    });
+
+    expect(events).toEqual(["persist", "execute", "consume"]);
+    expect(result.details).toEqual({
+      status: "error",
+      code: "not_found",
+      message: "Linear issue was not found or is not accessible.",
+      retryable: false,
+      reconciliationRequired: false,
+    });
+    expect(result.content).toEqual([{
+      type: "text",
+      text: JSON.stringify(result.details),
+    }]);
+    expect(JSON.stringify(result)).not.toContain("secret Linear diagnostic");
+    expect(port.consumeResult).toHaveBeenCalledOnce();
   });
 
   it("returns a safe failure for malformed typed results after consuming the durable response", async () => {
     const { port } = rpcPort((request) => rpcResult(request, {
       ok: true,
-      result: { data: { issueCreate: { success: true, issue: { id: "incomplete" } } } },
+      result: {
+        data: { issueCreate: { success: true, issue: { id: "incomplete" } } },
+        errors: [{ message: "secret Linear field diagnostic" }],
+      },
     }));
     const tool = createLinearTool({ rpc: port }, hostContext());
 
@@ -181,7 +223,12 @@ describe("linear tool", () => {
     });
     expect(JSON.parse(result.content[0]?.type === "text" ? result.content[0].text : ""))
       .toEqual(result.details);
+    expect(result.content[0]).toEqual({
+      type: "text",
+      text: JSON.stringify(result.details),
+    });
     expect(JSON.stringify(result)).not.toContain("Sensitive malformed response title");
+    expect(JSON.stringify(result)).not.toContain("secret Linear field diagnostic");
     expect(port.consumeResult).toHaveBeenCalledOnce();
   });
 

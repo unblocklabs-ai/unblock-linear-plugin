@@ -13,6 +13,23 @@ const cursor = z.string().trim().min(1).max(1_024);
 const entityId = z.string().uuid();
 const pageSize = z.number().int().min(1).max(50).default(20);
 const searchPageSize = z.number().int().min(1).max(20).default(10);
+const humanIssueIdentifierPattern = /^([A-Z][A-Z0-9]*)-([1-9][0-9]*)$/u;
+
+function parseHumanIssueIdentifier(value: string): { teamKey: string; issueNumber: number } | undefined {
+  const match = humanIssueIdentifierPattern.exec(value);
+  if (match === null) return undefined;
+  const issueNumber = Number(match[2]);
+  if (!Number.isSafeInteger(issueNumber)) return undefined;
+  return { teamKey: match[1], issueNumber };
+}
+
+const issueReference = z.union([
+  entityId,
+  z.string().trim().min(1).max(128).refine(
+    (value) => parseHumanIssueIdentifier(value) !== undefined,
+    { message: "Expected a Linear issue UUID or identifier such as ULD-8." },
+  ),
+]);
 
 const issueSummaryFields = {
   id: entityId,
@@ -40,6 +57,12 @@ const pageInfoSchema = z.strictObject({
 const issueConnectionSchema = z.strictObject({
   nodes: z.array(issueSummarySchema),
   pageInfo: pageInfoSchema,
+});
+const issueSearchPayloadSchema = issueConnectionSchema.extend({
+  totalCount: z.number().finite().nonnegative(),
+});
+const issueDetailConnectionSchema = z.strictObject({
+  nodes: z.array(issueDetailSchema),
 });
 
 export const LINEAR_OPERATION_ACTIONS = [
@@ -88,7 +111,7 @@ export const issuesSearchInputSchema = z.strictObject({
 
 export const issuesGetInputSchema = z.strictObject({
   action: z.literal(LINEAR_OPERATION_ACTIONS[2]),
-  id: identifier,
+  id: issueReference,
 });
 
 export const issuesCreateInputSchema = z.strictObject({
@@ -159,6 +182,13 @@ export type LinearMutationReconciliation = {
   entityId: string;
 };
 
+export class LinearOperationNotFoundError extends Error {
+  constructor() {
+    super("The requested Linear entity was not found.");
+    this.name = "LinearOperationNotFoundError";
+  }
+}
+
 export type CompiledLinearOperation = {
   action: LinearOperationInput["action"];
   graphql: {
@@ -198,13 +228,16 @@ const ISSUES_LIST = `query UnblockLinearIssuesList($first: Int!, $after: String,
 
 const ISSUES_SEARCH = `query UnblockLinearIssuesSearch($term: String!, $first: Int!, $after: String, $filter: IssueFilter, $includeArchived: Boolean!) {
   searchIssues(term: $term, first: $first, after: $after, filter: $filter, includeArchived: $includeArchived) {
+    totalCount
     nodes { ${ISSUE_SUMMARY_PROJECTION} }
     pageInfo { hasNextPage endCursor }
   }
 }`;
 
-const ISSUE_GET = `query UnblockLinearIssueGet($id: String!) {
-  issue(id: $id) { ${ISSUE_DETAIL_PROJECTION} }
+const ISSUE_GET = `query UnblockLinearIssueGet($first: Int!, $filter: IssueFilter!, $includeArchived: Boolean!) {
+  issues(first: $first, filter: $filter, includeArchived: $includeArchived) {
+    nodes { ${ISSUE_DETAIL_PROJECTION} }
+  }
 }`;
 
 const ISSUE_CREATE = `mutation UnblockLinearIssueCreate($input: IssueCreateInput!) {
@@ -283,6 +316,30 @@ function issueFilter(input: z.infer<typeof issuesListInputSchema>): LinearJsonVa
   return Object.keys(filter).length === 0 ? undefined : filter as LinearJsonValue;
 }
 
+function issueReferenceFilter(reference: string): LinearJsonValue {
+  const parsedId = entityId.safeParse(reference);
+  if (parsedId.success) return { id: { eq: parsedId.data } };
+
+  const parsedIdentifier = parseHumanIssueIdentifier(reference);
+  if (parsedIdentifier === undefined) {
+    throw new Error("Linear issue reference failed validation.");
+  }
+  return {
+    team: { key: { eq: parsedIdentifier.teamKey } },
+    number: { eq: parsedIdentifier.issueNumber },
+  };
+}
+
+function parseIssueDetailLookup(value: unknown) {
+  const nodes = parseEnvelope(
+    value,
+    z.strictObject({ issues: issueDetailConnectionSchema }),
+  ).issues.nodes;
+  if (nodes.length === 0) throw new LinearOperationNotFoundError();
+  if (nodes.length !== 1) throw new Error("Linear returned an invalid typed operation result.");
+  return nodes[0];
+}
+
 export function compileLinearOperation(
   input: LinearOperationInput,
   uuid: () => string,
@@ -319,13 +376,25 @@ export function compileLinearOperation(
             includeArchived: input.includeArchived ?? false,
           }) as Record<string, LinearJsonValue>,
         },
-        parseResult: (value) => parseEnvelope(value, z.strictObject({ searchIssues: issueConnectionSchema })).searchIssues,
+        parseResult: (value) => parseEnvelope(
+          value,
+          z.strictObject({ searchIssues: issueSearchPayloadSchema }),
+        ).searchIssues,
       };
     case "issues.get":
       return {
         action: input.action,
-        graphql: { action: "graphql", document: ISSUE_GET, operationName: "UnblockLinearIssueGet", variables: { id: input.id } },
-        parseResult: (value) => parseEnvelope(value, z.strictObject({ issue: issueDetailSchema.nullable() })).issue,
+        graphql: {
+          action: "graphql",
+          document: ISSUE_GET,
+          operationName: "UnblockLinearIssueGet",
+          variables: {
+            first: 2,
+            filter: issueReferenceFilter(input.id),
+            includeArchived: true,
+          },
+        },
+        parseResult: parseIssueDetailLookup,
       };
     case "issues.create": {
       const id = uuid();

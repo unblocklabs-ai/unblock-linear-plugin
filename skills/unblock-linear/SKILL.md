@@ -16,7 +16,8 @@ local OpenClaw transcript.
 2. Prefer a typed action. Use `action: "graphql"` only when no typed action can
    express the request, and then keep the request to one bounded operation.
 3. For lists, set a small `first` value. Follow `pageInfo.endCursor` with
-   `after` only when more results are needed.
+   `after` only while `pageInfo.hasNextPage` is true. No action auto-paginates;
+   never infer completion from `nodes.length`.
 4. Use explicit Linear IDs or issue identifiers where the action accepts them;
    never pass a team, state, assignee, or issue name as an ID.
 5. Treat a typed result with `status: "error"` as a failure and inspect its
@@ -41,15 +42,23 @@ For text search:
 { "action": "issues.search", "query": "onboarding", "first": 10 }
 ```
 
-Search is more tightly rate-limited by Linear than ordinary issue reads. Use a
-specific query and do not poll or repeatedly broaden searches. An optional
-`teamId` is a true team filter, not a ranking hint.
+Search uses Linear's ranked full-text/vector retrieval. `first` is a maximum,
+not a promised node count, so a page may be sparse. `totalCount` counts matches
+before pagination. Continue with `after: pageInfo.endCursor` only when
+`pageInfo.hasNextPage` is true. Search does not auto-paginate and is more tightly
+rate-limited than ordinary issue reads, so use a specific query and do not poll
+or repeatedly broaden searches. An optional `teamId` filters matches to that
+team; it is not a ranking hint.
 
 Fetch a known issue with:
 
 ```json
 { "action": "issues.get", "id": "ENG-123" }
 ```
+
+A missing or inaccessible issue returns `status: "error"` with
+`code: "not_found"`. Treat those cases identically; do not claim the issue does
+not exist or that the installation lacks access.
 
 ### Resolve IDs
 
@@ -96,6 +105,10 @@ narrow GraphQL read before considering another comment.
 Typed actions return safe failures as structured results. Raw `graphql` and
 `upload` do not share this result contract, so do not expect `status`, `code`,
 `entityType`, or `entityId` from those escape hatches.
+
+For direct OpenClaw tool calls, read the result as JSON text from `content`.
+Code Mode and Tool Search can use the same native value from `details`. Do not
+expect `structuredContent`.
 
 ## Advanced GraphQL
 
