@@ -16,6 +16,7 @@ import {
   type LinearRpcResult,
   type LinearToolIdentitySource,
 } from "../src/linear/tool.js";
+import { LINEAR_OPERATION_ACTIONS } from "../src/linear/operations.js";
 import type { UploadWorkflow } from "../src/relay/journal.js";
 
 const uuid = (value: number) => `00000000-0000-4000-8000-${String(value).padStart(12, "0")}`;
@@ -72,10 +73,10 @@ const hostContext = (overrides: Partial<OpenClawPluginToolContext> = {}): OpenCl
 });
 
 describe("linear tool", () => {
-  it("exports one registration factory with the graphql/upload discriminated schema", () => {
-    expect(linearToolParameters.oneOf).toHaveLength(2);
+  it("exports one registration factory with raw and typed action schemas", () => {
+    expect(linearToolParameters.oneOf).toHaveLength(10);
     expect(linearToolParameters.oneOf.map((branch) => branch.properties.action.const))
-      .toEqual(["graphql", "upload"]);
+      .toEqual(["graphql", "upload", ...LINEAR_OPERATION_ACTIONS]);
 
     const { port } = rpcPort((request) => rpcResult(request, { ok: true, result: {} }));
     const factory = createLinearToolFactory({ rpc: port });
@@ -128,6 +129,197 @@ describe("linear tool", () => {
     expect(result.details).toEqual(envelope);
     expect(JSON.parse(result.content[0]?.type === "text" ? result.content[0].text : ""))
       .toEqual(envelope);
+  });
+
+  it("compiles typed actions through the same durable executor and validates their result", async () => {
+    const response = {
+      nodes: [],
+      pageInfo: { hasNextPage: false, endCursor: null },
+    };
+    const { port, events } = rpcPort((request) => rpcResult(request, {
+      ok: true,
+      result: { data: { issues: response } },
+    }));
+    const tool = createLinearTool({ rpc: port, identity: identitySource(500) }, hostContext());
+
+    const result = await tool.execute("typed-list", {
+      action: "issues.list",
+      teamId: "10000000-0000-4000-8000-000000000001",
+      first: 5,
+    });
+
+    expect(events).toEqual(["persist", "execute", "consume"]);
+    expect(vi.mocked(port.executePersisted).mock.calls[0]?.[1].payload.params).toMatchObject({
+      operationName: "UnblockLinearIssuesList",
+      variables: {
+        first: 5,
+        includeArchived: false,
+        filter: { team: { id: { eq: "10000000-0000-4000-8000-000000000001" } } },
+      },
+    });
+    expect(result.details).toEqual(response);
+  });
+
+  it("returns a safe failure for malformed typed results after consuming the durable response", async () => {
+    const { port } = rpcPort((request) => rpcResult(request, {
+      ok: true,
+      result: { data: { issueCreate: { success: true, issue: { id: "incomplete" } } } },
+    }));
+    const tool = createLinearTool({ rpc: port }, hostContext());
+
+    const result = await tool.execute("typed-create", {
+      action: "issues.create",
+      teamId: "10000000-0000-4000-8000-000000000001",
+      title: "Sensitive malformed response title",
+    });
+    expect(result.details).toEqual({
+      status: "error",
+      code: "request_failed",
+      message: "The Linear request failed.",
+      retryable: false,
+      reconciliationRequired: false,
+    });
+    expect(JSON.parse(result.content[0]?.type === "text" ? result.content[0].text : ""))
+      .toEqual(result.details);
+    expect(JSON.stringify(result)).not.toContain("Sensitive malformed response title");
+    expect(port.consumeResult).toHaveBeenCalledOnce();
+  });
+
+  it("returns a safe failure for invalid typed input without touching durable state", async () => {
+    const { port } = rpcPort((request) => rpcResult(request, { ok: true, result: {} }));
+    const tool = createLinearTool({ rpc: port }, hostContext());
+
+    const result = await tool.execute("invalid-typed-create", {
+      action: "issues.create",
+      teamId: "not-a-linear-id",
+      title: "Sensitive invalid input title",
+      description: "Sensitive invalid input description",
+    });
+
+    expect(result.details).toEqual({
+      status: "error",
+      code: "invalid_input",
+      message: "Invalid Linear tool request.",
+      retryable: false,
+      reconciliationRequired: false,
+    });
+    expect(JSON.parse(result.content[0]?.type === "text" ? result.content[0].text : ""))
+      .toEqual(result.details);
+    expect(JSON.stringify(result)).not.toContain("Sensitive invalid input");
+    expect(port.getOrCreateRequest).not.toHaveBeenCalled();
+  });
+
+  it.each([
+    { code: "unauthorized" as const, retryable: false, expectedRetryable: false },
+    { code: "retryable" as const, retryable: true, expectedRetryable: true },
+  ])("returns a safe typed failure for $code without exposing inputs or Worker diagnostics", async ({
+    code,
+    retryable,
+    expectedRetryable,
+  }) => {
+    const { port } = rpcPort((request) => rpcResult(request, {
+      ok: false,
+      error: { code, message: "secret worker diagnostic", retryable },
+    }));
+    const tool = createLinearTool({ rpc: port }, hostContext());
+
+    const result = await tool.execute(`typed-${code}`, {
+      action: "issues.create",
+      teamId: "10000000-0000-4000-8000-000000000001",
+      title: "Sensitive remote failure title",
+      description: "Sensitive remote failure description",
+    });
+
+    expect(result.details).toMatchObject({
+      status: "error",
+      code,
+      retryable: expectedRetryable,
+      reconciliationRequired: false,
+    });
+    expect(result.details).not.toHaveProperty("entityType");
+    expect(result.details).not.toHaveProperty("entityId");
+    expect(JSON.stringify(result)).not.toContain("Sensitive remote failure");
+    expect(JSON.stringify(result)).not.toContain("secret worker diagnostic");
+    expect(port.consumeResult).not.toHaveBeenCalled();
+  });
+
+  it("preserves abort rejection for typed actions", async () => {
+    const abort = new Error("aborted");
+    abort.name = "AbortError";
+    const { port } = rpcPort(() => { throw abort; });
+    const tool = createLinearTool({ rpc: port }, hostContext());
+
+    await expect(tool.execute("aborted-list", { action: "issues.list" })).rejects.toBe(abort);
+  });
+
+  it("exposes only generated reconciliation metadata for an ambiguous typed create", async () => {
+    const { port } = rpcPort((request) => rpcResult(request, {
+      ok: false,
+      error: { code: "outcome_unknown", message: "secret worker diagnostic", retryable: false },
+    }));
+    const tool = createLinearTool({ rpc: port, identity: identitySource(600) }, hostContext());
+
+    const result = await tool.execute("typed-create", {
+      action: "issues.create",
+      teamId: "10000000-0000-4000-8000-000000000001",
+      title: "Secret customer title",
+      description: "Secret customer description",
+    });
+
+    expect(result.details).toMatchObject({
+      status: "error",
+      code: "outcome_unknown",
+      reconciliationRequired: true,
+      entityType: "issue",
+      entityId: uuid(600),
+    });
+    expect(result.details).toMatchObject({
+      message: `The Linear issue creation outcome is unknown. Query the issue with ID ${uuid(600)} before retrying; do not create it again until reconciled.`,
+    });
+    expect(JSON.parse(result.content[0]?.type === "text" ? result.content[0].text : ""))
+      .toEqual(result.details);
+    expect(JSON.stringify(result)).not.toContain("secret worker diagnostic");
+    expect(JSON.stringify(result)).not.toContain("Secret customer");
+    expect(vi.mocked(port.executePersisted).mock.calls[0]?.[1].payload.params.variables)
+      .toMatchObject({ input: { id: uuid(600) } });
+    expect(port.executePersisted).toHaveBeenCalledOnce();
+    expect(port.consumeResult).not.toHaveBeenCalled();
+  });
+
+  it("keeps a persisted create ID authoritative when the same tool call is re-entered", async () => {
+    let persisted: LinearGraphqlRpcRequest | undefined;
+    const fingerprints: string[] = [];
+    const port: DurableRpcPort = {
+      getRelayIdentity: () => ({ agentId: "agent" }),
+      getOrCreateRequest: vi.fn(async (_invocationId, fingerprint, create) => {
+        fingerprints.push(fingerprint);
+        const request = persisted ?? create();
+        persisted = request;
+        return request;
+      }),
+      executePersisted: vi.fn(async (_invocationId, request) => rpcResult(request, {
+        ok: false,
+        error: { code: "outcome_unknown", message: "ambiguous", retryable: false },
+      })),
+      consumeResult: vi.fn(async () => { persisted = undefined; }),
+    };
+    const tool = createLinearTool({ rpc: port, identity: identitySource(700) }, hostContext());
+    const input = {
+      action: "issues.create",
+      teamId: "10000000-0000-4000-8000-000000000001",
+      title: "One durable create",
+    } as const;
+
+    const first = await tool.execute("same-tool-call", input);
+    expect(first.details).toMatchObject({ entityId: uuid(700) });
+    const second = await tool.execute("same-tool-call", input);
+    expect(second.details).toMatchObject({ entityId: uuid(700) });
+
+    expect(fingerprints[0]).toBe(fingerprints[1]);
+    expect(vi.mocked(port.executePersisted).mock.calls[0]?.[1])
+      .toBe(vi.mocked(port.executePersisted).mock.calls[1]?.[1]);
+    expect(persisted?.payload.params.variables).toMatchObject({ input: { id: uuid(700) } });
+    expect(port.consumeResult).not.toHaveBeenCalled();
   });
 
   it("derives a stable opaque context and adds sessionId only through the Linear run binding", async () => {
@@ -395,9 +587,9 @@ describe("linear tool", () => {
       retryable: false,
       expectedCode: "outcome_unknown",
       expectedText: "The Linear mutation outcome is unknown. Reconcile it with a read query before trying another mutation.",
-      consumed: true,
+      consumed: false,
     },
-  ])("maps $workerCode without exposing Worker content", async ({
+  ])("raw GraphQL rejects $workerCode without exposing Worker content", async ({
     workerCode,
     retryable,
     expectedCode,

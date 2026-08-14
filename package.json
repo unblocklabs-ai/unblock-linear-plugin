@@ -15,6 +15,7 @@
     "dist/",
     "index.ts",
     "setup-entry.ts",
+    "skills/",
     "openclaw.plugin.json",
     "plugin-inspector.config.json"
   ],

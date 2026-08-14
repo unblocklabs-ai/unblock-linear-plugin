@@ -11,7 +11,7 @@ import {
 
 describe("plugin entrypoints", () => {
   it("keeps setup loading registration-only", () => {
-    expect(setupEntry).toEqual({ plugin: unblockLinearPlugin });
+    expect(setupEntry.plugin.id).toBe(unblockLinearPlugin.id);
     expect(setupEntry.plugin).not.toHaveProperty("gateway");
   });
 
@@ -60,11 +60,13 @@ describe("plugin entrypoints", () => {
       await readFile(new URL("../package.json", import.meta.url), "utf8"),
     ) as Record<string, unknown>;
     const metadata = packageJson.openclaw as Record<string, unknown>;
+    const files = packageJson.files as string[];
     const build = metadata.build as Record<string, unknown>;
     const peerDependencies = packageJson.peerDependencies as Record<string, unknown>;
     const devDependencies = packageJson.devDependencies as Record<string, unknown>;
 
     expect(metadata.runtimeExtensions).toEqual(["./dist/index.js"]);
+    expect(files).toContain("skills/");
     expect(peerDependencies.openclaw).toBe(">=2026.7.2-beta.7");
     expect(devDependencies.openclaw).toBe("2026.7.2-beta.7");
     expect(build.openclawVersion).toBe("2026.7.2-beta.7");
@@ -77,6 +79,7 @@ describe("plugin entrypoints", () => {
 
     expect(manifest.id).toBe(entry.id);
     expect(manifest.channels).toEqual([unblockLinearPlugin.id]);
+    expect(manifest.skills).toEqual(["./skills"]);
     expect(manifest.activation).toMatchObject({ onStartup: true });
   });
 });

@@ -1,0 +1,4 @@
+interface:
+  display_name: "Unblock Linear"
+  short_description: "Work with Linear issues and agent sessions"
+  default_prompt: "Use $unblock-linear to list my recently updated Linear issues."

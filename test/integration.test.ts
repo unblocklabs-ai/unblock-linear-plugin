@@ -13,6 +13,7 @@ import {
   createIntegrationRegistration,
   type IntegrationRegistration,
 } from "../src/integration.js";
+import { unblockLinearPlugin } from "../src/channel.js";
 import { parseOutboundRelayFrame, type OutboundRelayFrame } from "../src/relay/protocol.js";
 import { RelayJournal, type JournalSnapshot } from "../src/relay/journal.js";
 import type { RelaySocket, RelaySocketFactory } from "../src/relay/service.js";
@@ -261,6 +262,20 @@ describe("OpenClaw integration", () => {
       socketFactory,
     });
     const tool = requireTool(registration);
+    const statusAbort = new AbortController();
+    type GatewayStart = NonNullable<NonNullable<typeof unblockLinearPlugin.gateway>["startAccount"]>;
+    type GatewayContext = Parameters<GatewayStart>[0];
+    const statusSnapshots: ReturnType<GatewayContext["getStatus"]>[] = [];
+    const account = unblockLinearPlugin.config.resolveAccount(config);
+    const statusTask = unblockLinearPlugin.gateway?.startAccount?.({
+      cfg: config,
+      accountId: account.accountId,
+      account,
+      runtime: {} as GatewayContext["runtime"],
+      abortSignal: statusAbort.signal,
+      getStatus: () => statusSnapshots.at(-1) ?? { accountId: account.accountId },
+      setStatus: (snapshot) => statusSnapshots.push(snapshot),
+    });
 
     await expect(tool.execute("before-start", {
       action: "graphql",
@@ -273,6 +288,13 @@ describe("OpenClaw integration", () => {
       accountId: "default",
       running: true,
       connected: true,
+      statusState: "connected",
+    }));
+    await waitFor(() => expect(statusSnapshots.at(-1)).toMatchObject({
+      accountId: "default",
+      running: true,
+      connected: true,
+      lifecycle: "ready",
       statusState: "connected",
     }));
 
@@ -307,6 +329,14 @@ describe("OpenClaw integration", () => {
       details: { data: { viewer: { id: "viewer-1" } } },
     });
     await registration.service.stop?.(serviceContext(stateDir));
+    await waitFor(() => expect(statusSnapshots.at(-1)).toMatchObject({
+      running: false,
+      connected: false,
+      lifecycle: "stopped",
+      statusState: "stopped",
+    }));
+    statusAbort.abort();
+    await statusTask;
     expect(registration.getState()).toMatchObject({
       accountId: "default",
       running: false,

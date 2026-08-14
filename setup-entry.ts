@@ -5,8 +5,10 @@ import {
 import { unblockLinearPlugin } from "./src/channel.js";
 import type { ResolvedUnblockLinearAccount } from "./src/config.js";
 
+const { gateway: _runtimeGateway, ...setupPlugin } = unblockLinearPlugin;
+
 const unblockLinearSetupEntry: {
   plugin: ChannelPlugin<ResolvedUnblockLinearAccount>;
-} = defineSetupPluginEntry(unblockLinearPlugin);
+} = defineSetupPluginEntry(setupPlugin);
 
 export default unblockLinearSetupEntry;

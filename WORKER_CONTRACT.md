@@ -808,10 +808,9 @@ Never log:
 - Agent Activity bodies;
 - raw OpenClaw prompts or hidden reasoning.
 
-The status adapter emits content-free configured state and can map a
-host-supplied runtime snapshot into running, connected, lifecycle, and timestamp
-fields. The current relay service does not publish its live `IntegrationState`
-or start/stop timestamps into OpenClaw's channel runtime snapshot. Doctor
+The status adapter emits content-free configured state and maps the relay
+service's live `IntegrationState` into OpenClaw's channel runtime snapshot,
+including running, connected, lifecycle, and start/stop timestamps. Doctor
 preview warnings report only disabled accounts and missing or invalid
 configuration field names. Doctor does not resolve the secret, open a socket,
 inspect journal content, or claim endpoint/authentication health.

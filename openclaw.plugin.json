@@ -12,6 +12,7 @@
     "tools": ["linear"]
   },
   "channels": ["unblock-linear"],
+  "skills": ["./skills"],
   "channelConfigs": {
     "unblock-linear": {
       "label": "Unblock Linear",

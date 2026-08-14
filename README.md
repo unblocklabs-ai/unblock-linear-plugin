@@ -2,8 +2,8 @@
 
 An OpenClaw channel plugin that connects an enrolled OpenClaw agent to the
 Unblock Linear relay. Linear AgentSession work is delivered to OpenClaw, and
-the agent receives one `linear` tool for bounded GraphQL requests and approved
-media uploads.
+the agent receives one `linear` tool for common issue workflows, bounded
+GraphQL requests, and approved media uploads.
 
 ## Requirements
 
@@ -43,7 +43,7 @@ openclaw doctor
 For a published package, install the matching package version instead:
 
 ```sh
-openclaw plugins install @unblocklabs/unblock-linear
+openclaw plugins install npm:@unblocklabs/unblock-linear
 openclaw plugins enable unblock-linear
 ```
 
@@ -93,6 +93,29 @@ to the Worker.
 Restart the OpenClaw gateway after changing the plugin configuration. The
 plugin opens one authenticated WebSocket connection and resumes persisted work
 after reconnects.
+
+### Allow cross-channel session history
+
+Linear AgentSessions are stored as separate OpenClaw sessions. To let the same
+agent find and read those sessions from Slack or another channel, configure
+session-tool visibility at `agent` scope or broader:
+
+```json
+{
+  "tools": {
+    "sessions": {
+      "visibility": "agent"
+    }
+  }
+}
+```
+
+OpenClaw's default `tree` scope includes only the current session and sessions
+it spawned, so it hides independently created Linear sibling sessions. The
+`agent` scope exposes every session owned by the same OpenClaw agent, including
+other Slack channels or DMs; enable it only when those conversations share an
+appropriate trust boundary. This setting is required for cross-channel history,
+not for ordinary Linear delivery or use of the `linear` tool.
 
 ## Provision a new Linear app
 
@@ -151,10 +174,60 @@ then delete the old private app in Linear.
 
 ## The `linear` tool
 
-The plugin exposes one discriminated tool:
+The plugin exposes one discriminated tool. Prefer its typed actions for common
+workflows:
 
 ```ts
 type LinearToolInput =
+  | {
+      action: "issues.list";
+      first?: number;
+      after?: string;
+      teamId?: string;
+      stateId?: string;
+      assigneeId?: string;
+      includeArchived?: boolean;
+    }
+  | {
+      action: "issues.search";
+      query: string;
+      first?: number;
+      after?: string;
+      teamId?: string;
+      includeArchived?: boolean;
+    }
+  | { action: "issues.get"; id: string }
+  | {
+      action: "issues.create";
+      teamId: string;
+      title: string;
+      description?: string;
+      stateId?: string;
+      assigneeId?: string;
+      priority?: number;
+    }
+  | {
+      action: "issues.update";
+      id: string;
+      title?: string;
+      description?: string | null;
+      stateId?: string;
+      assigneeId?: string | null;
+      priority?: number;
+    }
+  | { action: "comments.create"; issueId: string; body: string }
+  | {
+      action: "teams.list";
+      first?: number;
+      after?: string;
+      includeArchived?: boolean;
+    }
+  | {
+      action: "states.list";
+      teamId: string;
+      first?: number;
+      after?: string;
+    }
   | {
       action: "graphql";
       document: string;
@@ -169,12 +242,60 @@ type LinearToolInput =
     };
 ```
 
-GraphQL requests are durably journaled and sent through the enrolled relay.
+For example:
+
+```json
+{ "action": "issues.list", "first": 10 }
+{ "action": "issues.search", "query": "onboarding", "first": 10 }
+{ "action": "issues.get", "id": "ENG-123" }
+{ "action": "teams.list", "first": 20 }
+{ "action": "states.list", "teamId": "10000000-0000-4000-8000-000000000001", "first": 20 }
+{ "action": "issues.create", "teamId": "10000000-0000-4000-8000-000000000001", "title": "Document agent onboarding" }
+{ "action": "issues.update", "id": "ENG-123", "stateId": "10000000-0000-4000-8000-000000000002" }
+{ "action": "comments.create", "issueId": "ENG-123", "body": "The setup is complete." }
+```
+
+Replace the illustrative UUIDs with IDs returned by your workspace.
+Use Linear UUIDs rather than names for teams, workflow states, and assignees.
+Issue reads, updates, and comments also accept a human-readable issue identifier
+such as `ENG-123`. List teams and workflow states first when a UUID is unknown,
+and follow `pageInfo.endCursor` only when more results are needed. On
+`issues.search`, `teamId` filters results to that team; it is not a ranking
+hint. List actions accept at most 50 results per page; search accepts at most 20
+and has a tighter Linear rate limit than ordinary issue reads, so prefer a
+specific query and avoid polling it.
+
+Use `action: "graphql"` only when the typed actions cannot express the needed
+operation. Every typed action is compiled to a bounded GraphQL operation,
+durably journaled, and sent through the same enrolled Worker relay. Credentials
+remain at the Worker; typed actions do not add Linear credentials to the
+plugin.
+
+If an issue or comment creation returns `outcome_unknown`, the error message
+and structured error result include the safe `entityType` and persisted
+`entityId`. Fetch that UUID to reconcile the mutation before deciding whether
+another mutation is needed. Never blindly repeat an ambiguous create.
+
+Typed actions return safe failures as structured results rather than failed
+tool calls. Treat a typed result with `status: "error"` as a failure, inspect
+its `code`, and follow any `entityId`. This keeps typed-action parameters out of
+the host adapter's failed-tool parameter-logging path. This behavior applies
+only to the typed actions above—not raw `graphql` or `upload`—and is not a claim
+that OpenClaw omits parameters from every log surface.
+
 Uploads accept only OpenClaw-approved inbound media references, request a
 Linear upload destination through GraphQL, validate the HTTPS destination, and
 stream the bytes directly to Linear. The plugin does not read arbitrary local
 paths, proxy general URLs, send file bytes through the WebSocket, or receive a
 Linear access token.
+
+The package also includes an `unblock-linear` skill with workflows for recent
+issues, issue creation, mutation reconciliation, uploads, and cross-channel
+Linear session lookup. Verify that OpenClaw discovered it after installation:
+
+```sh
+openclaw skills info unblock-linear
+```
 
 ## Troubleshooting
 
@@ -207,7 +328,7 @@ Releases require a clean `main` branch that exactly matches `origin/main`, an
 authenticated GitHub CLI, and permission to push to this repository:
 
 ```sh
-npm run release -- 0.2.0
+npm run release -- 0.3.0
 ```
 
 The release command:
@@ -216,12 +337,12 @@ The release command:
 2. Updates `package.json`, `package-lock.json`, and `openclaw.plugin.json` to the
    same version.
 3. Runs the full preflight and restores those files if validation fails.
-4. Commits `chore: release v0.2.0`, creates the tag, and atomically pushes both.
+4. Commits `chore: release v0.3.0`, creates the tag, and atomically pushes both.
 5. Creates the GitHub Release with generated notes.
 
 Publishing then runs in GitHub Actions through npm trusted publishing. Stable
 versions publish to npm's `latest` tag; prerelease versions such as
-`0.2.0-beta.1` create a GitHub prerelease and publish to npm's `next` tag. The
+`0.3.0-beta.1` create a GitHub prerelease and publish to npm's `next` tag. The
 workflow rejects a release when its Git tag, package version, and plugin
 manifest version do not match.
 
@@ -229,7 +350,7 @@ If GitHub Release creation fails after the atomic push, finish that final step
 without changing versions or tags:
 
 ```sh
-gh release create v0.2.0 --verify-tag --generate-notes --title v0.2.0
+gh release create v0.3.0 --verify-tag --generate-notes --title v0.3.0
 ```
 
 ## Security boundary

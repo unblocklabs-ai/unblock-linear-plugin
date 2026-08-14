@@ -27,7 +27,7 @@ describe("Unblock Linear channel", () => {
       reply: false,
     });
     expect(unblockLinearPlugin).not.toHaveProperty("outbound");
-    expect(unblockLinearPlugin).not.toHaveProperty("gateway");
+    expect(unblockLinearPlugin.gateway?.startAccount).toBeTypeOf("function");
   });
 
   it.each([

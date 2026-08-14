@@ -35,6 +35,10 @@ import {
   type RelaySocket,
   type RelaySocketFactory,
 } from "./relay/service.js";
+import {
+  publishIntegrationState,
+  type IntegrationState,
+} from "./integration-status.js";
 
 const SERVICE_ID = "unblock-linear-relay";
 const SECRET_PATH = "channels.unblock-linear.devicePrivateKey";
@@ -47,13 +51,6 @@ type ConfiguredAccount = ResolvedUnblockLinearAccount & Required<Pick<
   | "enrollmentGeneration"
   | "devicePrivateKey"
 >>;
-
-export type IntegrationState = Readonly<{
-  accountId?: string;
-  running: boolean;
-  connected: boolean;
-  statusState: RelayServiceState;
-}>;
 
 export type IntegrationDependencies = Readonly<{
   env?: NodeJS.ProcessEnv;
@@ -176,6 +173,7 @@ export function createIntegrationRegistration(
     connected: false,
     statusState: "stopped",
   };
+  publishIntegrationState(state);
 
   const updateState = (statusState: RelayServiceState, accountId?: string): void => {
     state = {
@@ -185,6 +183,7 @@ export function createIntegrationRegistration(
       connected: statusState === "connected",
       statusState,
     };
+    publishIntegrationState(state);
   };
 
   const service: Parameters<OpenClawPluginApi["registerService"]>[0] = {

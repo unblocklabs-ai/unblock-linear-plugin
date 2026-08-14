@@ -12,6 +12,10 @@ import {
   type ResolvedUnblockLinearAccount,
   unblockLinearChannelConfigSchema,
 } from "./config.js";
+import {
+  subscribeIntegrationState,
+  type IntegrationState,
+} from "./integration-status.js";
 
 const channelCore = {
   id: "unblock-linear",
@@ -94,6 +98,7 @@ function runtimeTimestamp(
 
 type RelayStatusState =
   | "stopped"
+  | "starting"
   | "connected"
   | "reconnect_wait"
   | "revoked"
@@ -101,7 +106,8 @@ type RelayStatusState =
 
 function relayStatusState(runtime: Record<string, unknown> | undefined): RelayStatusState {
   const value = runtime?.statusState;
-  return value === "connected" ||
+  return value === "starting" ||
+    value === "connected" ||
     value === "reconnect_wait" ||
     value === "revoked" ||
     value === "enrollment_replaced"
@@ -110,6 +116,9 @@ function relayStatusState(runtime: Record<string, unknown> | undefined): RelaySt
 }
 
 function relayLifecycle(state: RelayStatusState) {
+  if (state === "starting") {
+    return "starting" as const;
+  }
   if (state === "connected") {
     return "ready" as const;
   }
@@ -122,27 +131,71 @@ function relayLifecycle(state: RelayStatusState) {
   return "stopped" as const;
 }
 
+function integrationRuntime(
+  state: IntegrationState,
+  timestamps: Readonly<{ lastStartAt: number | null; lastStopAt: number | null }>,
+) {
+  return {
+    accountId: state.accountId ?? DEFAULT_UNBLOCK_LINEAR_ACCOUNT_ID,
+    running: state.running,
+    connected: state.connected,
+    statusState: state.statusState,
+    lastStartAt: timestamps.lastStartAt,
+    lastStopAt: timestamps.lastStopAt,
+  };
+}
+
+function buildAccountSnapshot(
+  account: ResolvedUnblockLinearAccount,
+  runtime: Record<string, unknown> | undefined,
+) {
+  const relayState = relayStatusState(runtime);
+  return {
+    accountId: account.accountId,
+    name: account.name,
+    enabled: account.enabled,
+    configured: account.configured,
+    running: runtimeBoolean(runtime, "running"),
+    connected: relayState === "connected",
+    lifecycle: relayLifecycle(relayState),
+    statusState: relayState,
+    terminalDisconnect:
+      relayState === "revoked" || relayState === "enrollment_replaced",
+    lastStartAt: runtimeTimestamp(runtime, "lastStartAt"),
+    lastStopAt: runtimeTimestamp(runtime, "lastStopAt"),
+  };
+}
+
 export const unblockLinearPlugin: ChannelPlugin<ResolvedUnblockLinearAccount> = {
   ...channelCore,
   status: {
     defaultRuntime,
-    buildAccountSnapshot: ({ account, runtime }) => {
-      const safeRuntime = runtime as Record<string, unknown> | undefined;
-      const relayState = relayStatusState(safeRuntime);
-      return {
-        accountId: account.accountId,
-        name: account.name,
-        enabled: account.enabled,
-        configured: account.configured,
-        running: runtimeBoolean(safeRuntime, "running"),
-        connected: relayState === "connected",
-        lifecycle: relayLifecycle(relayState),
-        statusState: relayState,
-        terminalDisconnect:
-          relayState === "revoked" || relayState === "enrollment_replaced",
-        lastStartAt: runtimeTimestamp(safeRuntime, "lastStartAt"),
-        lastStopAt: runtimeTimestamp(safeRuntime, "lastStopAt"),
-      };
+    buildAccountSnapshot: ({ account, runtime }) =>
+      buildAccountSnapshot(account, runtime as Record<string, unknown> | undefined),
+  },
+  gateway: {
+    async startAccount(ctx): Promise<void> {
+      let wasRunning = false;
+      let lastStartAt = ctx.getStatus().lastStartAt ?? null;
+      let lastStopAt = ctx.getStatus().lastStopAt ?? null;
+
+      await new Promise<void>((resolve) => {
+        const unsubscribe = subscribeIntegrationState((state) => {
+          const now = Date.now();
+          if (state.running && !wasRunning) lastStartAt = now;
+          if (!state.running && wasRunning) lastStopAt = now;
+          wasRunning = state.running;
+
+          const runtime = integrationRuntime(state, { lastStartAt, lastStopAt });
+          if (!ctx.abortSignal.aborted) ctx.setStatus(buildAccountSnapshot(ctx.account, runtime));
+        });
+        const stop = () => {
+          unsubscribe();
+          resolve();
+        };
+        if (ctx.abortSignal.aborted) stop();
+        else ctx.abortSignal.addEventListener("abort", stop, { once: true });
+      });
     },
   },
   doctor: {
