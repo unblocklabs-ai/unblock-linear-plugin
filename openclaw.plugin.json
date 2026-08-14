@@ -2,7 +2,7 @@
   "id": "unblock-linear",
   "kind": "channel",
   "name": "Unblock Linear",
-  "version": "0.2.1",
+  "version": "0.3.0",
   "description": "Runs Linear AgentSession work through OpenClaw.",
   "activation": {
     "onStartup": true,
