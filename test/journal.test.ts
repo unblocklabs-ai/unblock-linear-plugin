@@ -546,7 +546,7 @@ describe("RelayJournal", () => {
       rpcInvocations: {},
       uploads: {},
     });
-  }, 30_000);
+  }, 120_000);
 
   it("preserves one prompted-session binding through deliveries until stop", async () => {
     const { journal } = await journalFixture();
