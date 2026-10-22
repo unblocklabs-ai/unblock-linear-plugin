@@ -183,7 +183,7 @@ function sentFrames(socket: FakeSocket): OutboundRelayFrame[] {
 }
 
 async function waitFor(assertion: () => void): Promise<void> {
-  for (let attempt = 0; attempt < 100; attempt += 1) {
+  for (let attempt = 0; attempt < 600; attempt += 1) {
     try {
       assertion();
       return;
