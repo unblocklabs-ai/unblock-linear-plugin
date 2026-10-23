@@ -8,6 +8,7 @@ import {
   type DeliveryRuntimePort,
   type RelayPort,
 } from "../src/delivery/executor.js";
+import { createDeliveryRecoveryInspector } from "../src/delivery/recovery.js";
 import {
   LINEAR_RUN_BINDING_KEY,
   parseLinearRunBinding,
@@ -234,10 +235,17 @@ describe("DeliveryExecutor", () => {
     expect(parseLinearRunBinding({ ...binding, contextId: "" })).toBeUndefined();
   });
 
-  it("routes by standard channel binding, persists before sends, and leaves tool policy untouched", async () => {
+  it.each(["sync", "async"])("routes with the %s getter, persists before sends, and leaves tool policy untouched", async (getter) => {
     const journal = await journalFixture();
     const fixture = executorFixture({ journal, createId: idFactory(20_000) });
     const frame = deliveryFrame();
+    if (getter === "async") {
+      fixture.runtime.agent.session.getSessionEntryAsync = async (input) =>
+        fixture.sessionEntries.get(input.sessionKey);
+      vi.mocked(fixture.runtime.agent.session.getSessionEntry).mockImplementation(() => {
+        throw new Error("The synchronous getter must not run on an async host");
+      });
+    }
 
     const result = await fixture.executor.execute(frame);
 
@@ -365,7 +373,7 @@ describe("DeliveryExecutor", () => {
     expect(journal.getDelivery(prompted.payload.deliveryId)?.status).toBe("completed");
   });
 
-  it("uses transcript/tool recovery facts without claiming exactly-once execution", async () => {
+  it.each([false, true])("uses recovery facts with an offline stop during lookup: %s", async (stopDuringRecovery) => {
     const journal = await journalFixture();
     const frame = deliveryFrame({ delivery: 120 });
     const binding: SessionBinding = {
@@ -402,10 +410,31 @@ describe("DeliveryExecutor", () => {
       },
       recordedAt: "2026-08-12T12:00:00.000Z",
     });
-    const inspectRecovery = vi.fn(async () => ({ kind: "reconcile" as const }));
+    let releaseLookup: (() => void) | undefined;
+    const held = new Promise<void>((resolve) => {
+      releaseLookup = resolve;
+    });
+    let lookupStarted: (() => void) | undefined;
+    const started = new Promise<void>((resolve) => {
+      lookupStarted = resolve;
+    });
+    const inspectRecovery = vi.fn(createDeliveryRecoveryInspector({
+      readTranscript: async () => [],
+      readSessionEntry: async () => {
+        lookupStarted?.();
+        await held;
+        return undefined;
+      },
+    }));
     const fixture = executorFixture({ journal, inspectRecovery });
 
-    const result = await fixture.executor.execute(frame);
+    const execution = fixture.executor.execute(frame);
+    await started;
+    const cancellation = stopDuringRecovery
+      ? fixture.executor.abortAllAndWaitOffline()
+      : undefined;
+    releaseLookup?.();
+    const result = await execution;
 
     expect(result.recovered).toBe(true);
     expect(inspectRecovery).toHaveBeenCalledWith(expect.objectContaining({
@@ -413,11 +442,99 @@ describe("DeliveryExecutor", () => {
       toolRecovery: expect.objectContaining({ state: "ambiguous", reconciliationRequired: true }),
     }));
     expect(fixture.resolveAgentRoute).not.toHaveBeenCalled();
+    if (stopDuringRecovery) {
+      await expect(cancellation).resolves.toBe(true);
+      expect(result.outcome).toBe("canceled");
+      expect(fixture.runEmbeddedAgent).not.toHaveBeenCalled();
+      expect(fixture.sent.some((sent) => sent.type === "activity")).toBe(false);
+      expect(journal.getDelivery(frame.payload.deliveryId)?.status).toBe("canceled");
+      expect(journal.getReplayEntries(frame.payload.deliveryId)).toEqual([
+        expect.objectContaining({
+          kind: "delivery_status",
+          frame: expect.objectContaining({
+            payload: expect.objectContaining({ status: "canceled" }),
+          }),
+        }),
+      ]);
+      return;
+    }
     expect(fixture.runEmbeddedAgent.mock.calls[0]?.[0]).toMatchObject({
       sessionTarget: binding.sessionTarget,
       prompt: frame.payload.prompt,
       extraSystemPrompt: expect.stringContaining("reconcile prior tool effects"),
     });
+  });
+
+  it.each(["entry", "rejected", "terminal-write-failed"])("settles an offline stop with %s lookup", async (lookupOutcome) => {
+    const journal = await journalFixture();
+    const fixture = executorFixture({ journal });
+    const frame = deliveryFrame({ delivery: 129 });
+    const readFailure = new Error("Session read unavailable");
+    const persistenceFailure = new Error("Terminal journal unavailable");
+    let releaseLookup: (() => void) | undefined;
+    const held = new Promise<void>((resolve) => {
+      releaseLookup = resolve;
+    });
+    let lookupStarted: (() => void) | undefined;
+    const started = new Promise<void>((resolve) => {
+      lookupStarted = resolve;
+    });
+    fixture.runtime.agent.session.getSessionEntryAsync = async (input) => {
+      lookupStarted?.();
+      await held;
+      if (lookupOutcome !== "entry") throw readFailure;
+      return fixture.sessionEntries.get(input.sessionKey);
+    };
+    const execution = fixture.executor.execute(frame);
+    await Promise.race([
+      started,
+      execution.then(() => { throw new Error("Delivery bypassed the async lookup"); }),
+    ]);
+
+    if (lookupOutcome === "terminal-write-failed") {
+      vi.spyOn(journal, "addReplay").mockRejectedValueOnce(persistenceFailure);
+    }
+    const executionCheck = lookupOutcome === "entry"
+      ? expect(execution).resolves.toMatchObject({ outcome: "canceled" })
+      : expect(execution).rejects.toBe(lookupOutcome === "rejected" ? readFailure : persistenceFailure);
+    const cancellation = fixture.executor.abortAllAndWaitOffline();
+    const cancellationCheck = lookupOutcome === "terminal-write-failed"
+      ? expect(cancellation).rejects.toBe(persistenceFailure)
+      : expect(cancellation).resolves.toBe(true);
+    releaseLookup?.();
+    await Promise.all([executionCheck, cancellationCheck]);
+    expect(fixture.runEmbeddedAgent).not.toHaveBeenCalled();
+    expect(fixture.runtime.agent.session.getSessionEntry).not.toHaveBeenCalled();
+    expect(fixture.sent).toEqual([]);
+    if (lookupOutcome === "terminal-write-failed") {
+      expect(journal.getDelivery(frame.payload.deliveryId)?.status).toBe("offered");
+      expect(journal.getReplayEntries(frame.payload.deliveryId)).toEqual([]);
+      return;
+    }
+    expect(journal.getDelivery(frame.payload.deliveryId)).toMatchObject({
+      status: "canceled",
+      terminalAcknowledged: false,
+    });
+    expect(journal.getReplayEntries(frame.payload.deliveryId)).toEqual([
+      expect.objectContaining({
+        kind: "delivery_status",
+        frame: expect.objectContaining({
+          payload: expect.objectContaining({ status: "canceled" }),
+        }),
+      }),
+    ]);
+  });
+
+  it("propagates async binding read errors without using the synchronous getter", async () => {
+    const journal = await journalFixture();
+    const fixture = executorFixture({ journal });
+    const failure = new Error("Session read unavailable");
+    fixture.runtime.agent.session.getSessionEntryAsync = async () => { throw failure; };
+
+    await expect(fixture.executor.execute(deliveryFrame())).rejects.toBe(failure);
+    expect(fixture.runtime.agent.session.getSessionEntry).not.toHaveBeenCalled();
+    expect(fixture.runEmbeddedAgent).not.toHaveBeenCalled();
+    expect(fixture.sent).toEqual([]);
   });
 
   it("isolates session and team cancellation to the matching active delivery", async () => {

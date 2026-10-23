@@ -1,4 +1,4 @@
-import { describe, expect, it, vi } from "vitest";
+import { afterEach, describe, expect, it, vi } from "vitest";
 import {
   captureDeliveryRecoveryBaseline,
   createDeliveryRecoveryInspector,
@@ -168,4 +168,55 @@ describe("DeliveryRecoveryInspector", () => {
     await expect(inspect(recoveryInput({ transcriptWatermark: baseline })))
       .resolves.toEqual({ kind: "reconcile" });
   });
+});
+
+describe("DeliveryRecoveryInspector SDK compatibility", () => {
+  afterEach(() => {
+    vi.doUnmock("openclaw/plugin-sdk/session-store-runtime");
+    vi.resetModules();
+  });
+
+  it.each(["sync", "async", "missing", "rejected"])(
+    "uses the public %s session reader without replaying through another capability",
+    async (mode) => {
+      const entry = {
+        sessionId: binding.openclawSessionId,
+        updatedAt: 0,
+        restartRecoveryTerminalRunIds: [delivery.deliveryId],
+      };
+      const readSync = vi.fn(() => entry);
+      const readAsync = vi.fn(async () => {
+        if (mode === "rejected") throw new Error("Session read unavailable");
+        return mode === "missing" ? undefined : entry;
+      });
+      vi.doMock("openclaw/plugin-sdk/session-store-runtime", () => ({
+        getSessionEntry: readSync,
+        getSessionEntryAsync: mode === "sync" ? undefined : readAsync,
+        readRecentUserAssistantTextForSession: async () => [
+          { id: "assistant-before", role: "assistant", text: "Previous turn." },
+          { id: "assistant-current", role: "assistant", text: "Recovered response." },
+        ],
+      }));
+      vi.resetModules();
+      const { createDeliveryRecoveryInspector: createInspector } = await import(
+        "../src/delivery/recovery.js"
+      );
+      const result = await createInspector()(recoveryInput({
+        transcriptWatermark: { turnId: delivery.deliveryId, messageId: "assistant-before" },
+      }));
+
+      expect(result).toEqual(mode === "rejected"
+        ? { kind: "reconcile" }
+        : mode === "missing"
+        ? { kind: "resume" }
+        : { kind: "completed", response: "Recovered response." });
+      if (mode === "sync") {
+        expect(readSync).toHaveBeenCalledOnce();
+        expect(readAsync).not.toHaveBeenCalled();
+      } else {
+        expect(readAsync).toHaveBeenCalledOnce();
+        expect(readSync).not.toHaveBeenCalled();
+      }
+    },
+  );
 });

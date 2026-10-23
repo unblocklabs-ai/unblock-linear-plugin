@@ -32,6 +32,7 @@ type ActivityFrame = Extract<OutboundRelayFrame, { type: "activity" }>;
 type AgentActivity = ActivityFrame["payload"]["activity"];
 type EmbeddedRunInput = Parameters<PluginRuntime["agent"]["runEmbeddedAgent"]>[0];
 type EmbeddedRunResult = Awaited<ReturnType<PluginRuntime["agent"]["runEmbeddedAgent"]>>;
+type SessionEntryGetter = PluginRuntime["agent"]["session"]["getSessionEntry"];
 
 /** The RelayService surface used here. Activity/status methods persist before transport. */
 export type RelayPort = {
@@ -70,7 +71,11 @@ export type DeliveryRuntimePort = {
     session: Pick<
       PluginRuntime["agent"]["session"],
       "resolveStorePath" | "getSessionEntry"
-    >;
+    > & {
+      getSessionEntryAsync?: (
+        ...args: Parameters<SessionEntryGetter>
+      ) => Promise<ReturnType<SessionEntryGetter>>;
+    };
   };
 };
 
@@ -170,7 +175,14 @@ export class DeliveryExecutor {
     active.offlineTerminal = true;
     active.controller.abort(new Error("Linear relay access terminated"));
     await this.options.journal.removeCanceledSessionRpcs(active.frame.sessionId);
-    await active.promise;
+    try {
+      await active.promise;
+    } catch (error) {
+      // Binding preparation can fail after the offline stop has already settled.
+      if (this.options.journal.getDelivery(active.frame.payload.deliveryId)?.status !== "canceled") {
+        throw error;
+      }
+    }
     return true;
   }
 
@@ -224,7 +236,12 @@ export class DeliveryExecutor {
     }
 
     if (!binding) {
-      binding = await this.createBinding(frame);
+      try {
+        binding = await this.createBinding(frame);
+      } catch (error) {
+        if (active.controller.signal.aborted) await this.sendTerminal(frame, "canceled");
+        throw error;
+      }
     }
     active.binding = binding;
     delivery = this.options.journal.getDelivery(frame.payload.deliveryId) ?? delivery;
@@ -245,6 +262,11 @@ export class DeliveryExecutor {
       };
     }
 
+    if (active.controller.signal.aborted) {
+      await this.sendTerminal(frame, "canceled");
+      return { deliveryId: frame.payload.deliveryId, outcome: "canceled", binding, recovered: priorDelivery !== undefined };
+    }
+
     if (delivery.openclawSessionId !== binding.openclawSessionId) {
       delivery = await this.options.journal.updateDelivery(frame.payload.deliveryId, {
         openclawSessionId: binding.openclawSessionId,
@@ -261,6 +283,10 @@ export class DeliveryExecutor {
     const recovery = priorDelivery
       ? await this.inspectRecovery(delivery, binding)
       : { kind: "resume" as const };
+    if (active.controller.signal.aborted) {
+      await this.sendTerminal(frame, "canceled");
+      return { deliveryId: frame.payload.deliveryId, outcome: "canceled", binding, recovered: priorDelivery !== undefined };
+    }
     await this.sendStartedIfNeeded(frame, delivery);
 
     if (recovery.kind === "completed") {
@@ -363,12 +389,16 @@ export class DeliveryExecutor {
     await Promise.all(metadataTasks);
     if (recordError !== undefined) throw recordError;
 
-    const entry = this.options.runtime.agent.session.getSessionEntry({
+    const session = this.options.runtime.agent.session;
+    const request: Parameters<SessionEntryGetter>[0] = {
       agentId: route.agentId,
       sessionKey: route.sessionKey,
       storePath,
       readConsistency: "latest",
-    });
+    };
+    const entry = session.getSessionEntryAsync
+      ? await session.getSessionEntryAsync(request)
+      : session.getSessionEntry(request);
     if (entry === undefined) throw new DeliveryExecutorError("missing_binding");
     const sessionId = entry.sessionId;
     if (frame.payload.openclawSessionId !== undefined &&
@@ -476,6 +506,10 @@ export class DeliveryExecutor {
         deliveryId: frame.payload.deliveryId,
         teamId: frame.payload.teamId,
       } satisfies LinearRunBinding;
+      if (active.controller.signal.aborted) {
+        await this.sendTerminal(frame, "canceled");
+        return { deliveryId: frame.payload.deliveryId, outcome: "canceled", binding, recovered: input.recovered };
+      }
       const result = await withLinearRunBindingFallback({
         agentId,
         sessionId: binding.sessionTarget.sessionId,

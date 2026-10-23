@@ -1,8 +1,5 @@
-import {
-  getSessionEntry,
-  readRecentUserAssistantTextForSession,
-  type SessionEntry,
-} from "openclaw/plugin-sdk/session-store-runtime";
+import * as sessionStoreRuntime from "openclaw/plugin-sdk/session-store-runtime";
+import type { SessionEntry } from "openclaw/plugin-sdk/session-store-runtime";
 import type {
   DeliveryRecord,
   SessionBinding,
@@ -11,6 +8,11 @@ import type {
 } from "../relay/journal.js";
 
 const TRANSCRIPT_LIMIT = 64;
+const sessionStore: typeof sessionStoreRuntime & {
+  getSessionEntryAsync?: (
+    ...args: Parameters<typeof sessionStoreRuntime.getSessionEntry>
+  ) => Promise<ReturnType<typeof sessionStoreRuntime.getSessionEntry>>;
+} = sessionStoreRuntime;
 // Stored in eventId, which this plugin never otherwise populates. A NUL-prefixed
 // marker cannot be a public OpenClaw message id and keeps an empty baseline distinct
 // from an ID-less assistant history.
@@ -59,7 +61,8 @@ export type DeliverySessionEntryReader = (request: Readonly<{
   sessionKey: string;
   storePath: string;
   readConsistency: "latest";
-}>) => Pick<SessionEntry, "restartRecoveryTerminalRunIds"> | undefined;
+}>) => Pick<SessionEntry, "restartRecoveryTerminalRunIds"> | undefined |
+  Promise<Pick<SessionEntry, "restartRecoveryTerminalRunIds"> | undefined>;
 
 export type DeliveryRecoveryBaselineOptions = Pick<
   DeliveryRecoveryInspectorOptions,
@@ -95,7 +98,7 @@ export function createDeliveryRecoveryInspector(
           role: "assistant",
           limit: TRANSCRIPT_LIMIT,
         }),
-        Promise.resolve(readSessionEntry({ ...target, readConsistency: "latest" })),
+        readSessionEntry({ ...target, readConsistency: "latest" }),
       ]);
     } catch {
       return { kind: "reconcile" };
@@ -146,16 +149,18 @@ export async function captureDeliveryRecoveryBaseline(
 async function readPublicTranscript(
   request: Readonly<TranscriptReadRequest>,
 ): Promise<readonly unknown[]> {
-  return readRecentUserAssistantTextForSession(request);
+  return sessionStore.readRecentUserAssistantTextForSession(request);
 }
 
-function readPublicSessionEntry(request: Readonly<{
+async function readPublicSessionEntry(request: Readonly<{
   agentId: string;
   sessionKey: string;
   storePath: string;
   readConsistency: "latest";
-}>): Pick<SessionEntry, "restartRecoveryTerminalRunIds"> | undefined {
-  return getSessionEntry(request);
+}>): Promise<Pick<SessionEntry, "restartRecoveryTerminalRunIds"> | undefined> {
+  return sessionStore.getSessionEntryAsync
+    ? sessionStore.getSessionEntryAsync(request)
+    : sessionStore.getSessionEntry(request);
 }
 
 function parseRecoveryBaseline(
