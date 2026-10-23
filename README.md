@@ -5,6 +5,10 @@ Unblock Linear relay. Linear AgentSession work is delivered to OpenClaw, and
 the agent receives one `linear` tool for common issue workflows, bounded
 GraphQL requests, and approved media uploads.
 
+The packaged Doctor contract confirms that existing enrollment settings and
+integration state need no format conversion. `openclaw doctor --fix` can finish
+an upgrade's deferred inspection without resetting enrollment or work history.
+
 ## Requirements
 
 - OpenClaw **2026.7.2-beta.7 or newer**
